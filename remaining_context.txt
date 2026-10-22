@@ -1,0 +1,1398 @@
+===== SESSION SCHEMAS =====
+"""
+Session and conversation schemas.
+"""
+
+from pydantic import BaseModel, Field, UUID4
+from typing import Optional, List
+from datetime import datetime
+
+
+class SessionCreate(BaseModel):
+    """Session creation request."""
+    language: str = Field("hi", pattern="^(hi|en|mr|ta|te)$")
+    user_type: str = Field("citizen", pattern="^(citizen|volunteer|admin)$")
+    state: Optional[str] = None
+    district: Optional[str] = None
+    age_group: Optional[str] = None
+    gender: Optional[str] = None
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "language": "hi",
+                "user_type": "citizen",
+                "state": "Maharashtra",
+                "district": "Mumbai"
+            }
+        }
+    }
+
+
+class SessionResponse(BaseModel):
+    """Session response."""
+    id: UUID4
+    session_token: str
+    language: str
+    user_type: str
+    state: Optional[str]
+    district: Optional[str]
+    is_active: str
+    created_at: datetime
+    expires_at: datetime
+    
+    model_config = {
+        "from_attributes": True
+    }
+
+
+class MessageCreate(BaseModel):
+    """Message creation request."""
+    content: str = Field(..., min_length=1, max_length=5000)
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "content": "मुझे घरेलू हिंसा के मामले में मदद चाहिए"
+            }
+        }
+    }
+
+
+class MessageResponse(BaseModel):
+    """Message response."""
+    id: UUID4
+    role: str
+    content: str
+    content_translated: Optional[str]
+    detected_language: Optional[str]
+    sequence: int
+    created_at: datetime
+    
+    model_config = {
+        "from_attributes": True
+    }
+
+
+class ConversationResponse(BaseModel):
+    """Full conversation response."""
+    session_id: UUID4
+    messages: List[MessageResponse]
+    total_messages: int
+
+===== AUTH SCHEMAS =====
+"""
+Authentication schemas.
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+
+class LoginRequest(BaseModel):
+    """Login request schema."""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6)
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "username": "admin",
+                "password": "securepassword"
+            }
+        }
+    }
+
+
+class LoginResponse(BaseModel):
+    """Login response schema."""
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = 3600
+    user: dict
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "access_token": "eyJ0eXAiOiJKV1QiLCJhbGc...",
+                "token_type": "bearer",
+                "expires_in": 3600,
+                "user": {
+                    "id": "123e4567-e89b-12d3-a456-426614174000",
+                    "username": "admin",
+                    "email": "admin@nyayasetu.org",
+                    "role": "admin"
+                }
+            }
+        }
+    }
+
+
+class TokenData(BaseModel):
+    """JWT token payload schema."""
+    sub: str  # subject (username)
+    role: str
+    user_id: str
+    exp: Optional[int] = None
+
+===== LEGAL RESOURCE MODEL =====
+"""
+Legal domain models - issues, rules, resources.
+"""
+
+from sqlalchemy import Column, String, DateTime, Text, Boolean, Float, Integer, JSON
+from sqlalchemy.sql import func
+import uuid
+import enum
+
+from app.db.session import Base
+
+
+class ResourceTypeEnum(str, enum.Enum):
+    """Types of legal aid resources."""
+    LEGAL_AID_CENTER = "legal_aid_center"
+    NGO = "ngo"
+    PRO_BONO_LAWYER = "pro_bono_lawyer"
+    GOVERNMENT_SCHEME = "government_scheme"
+    COURT = "court"
+    HELPLINE = "helpline"
+
+
+class VerificationStatusEnum(str, enum.Enum):
+    """Verification status for legal information."""
+    VERIFIED = "verified"
+    PENDING = "pending"
+    UNVERIFIED = "unverified"
+
+
+class LegalIssue(Base):
+    """Legal issue categories and subcategories."""
+    
+    __tablename__ = "legal_issues"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Issue details
+    name = Column(String(200), nullable=False, unique=True)
+    name_hi = Column(String(200), nullable=True)  # Hindi translation
+    category = Column(String(100), nullable=False, index=True)
+    subcategory = Column(String(100), nullable=True)
+    
+    # Description
+    description = Column(Text, nullable=True)
+    description_hi = Column(Text, nullable=True)
+    
+    # Classification
+    keywords = Column(JSON, nullable=True)
+    keywords_hi = Column(JSON, nullable=True)
+    
+    # Metadata
+    is_active = Column(Boolean, nullable=False, default=True)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<LegalIssue(name='{self.name}', category='{self.category}')>"
+
+
+class LegalRule(Base):
+    """Legal rules, acts, and provisions."""
+    
+    __tablename__ = "legal_rules"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Rule identification
+    title = Column(String(500), nullable=False)
+    title_hi = Column(String(500), nullable=True)
+    act_name = Column(String(200), nullable=False, index=True)
+    section = Column(String(100), nullable=True)
+    
+    # Content
+    content = Column(Text, nullable=False)
+    content_hi = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
+    
+    # Classification
+    legal_area = Column(String(100), nullable=True, index=True)
+    applicable_states = Column(JSON, nullable=True)
+    
+    # Verification
+    verification_status = Column(String(20), nullable=False, default=VerificationStatusEnum.PENDING)
+    verified_by = Column(String(200), nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    source_url = Column(String(1000), nullable=True)
+    
+    # Timestamps
+    effective_from = Column(DateTime(timezone=True), nullable=True)
+    effective_until = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<LegalRule(act='{self.act_name}', section='{self.section}')>"
+
+
+class EligibilityRule(Base):
+    """Eligibility rules for legal aid programs."""
+    
+    __tablename__ = "eligibility_rules"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Rule identification
+    program_name = Column(String(200), nullable=False, index=True)
+    program_name_hi = Column(String(200), nullable=True)
+    
+    # Criteria
+    rule_type = Column(String(50), nullable=False)  # "income", "category", "issue_type", "location"
+    condition = Column(String(100), nullable=False)  # "less_than", "equals", "in_list", etc.
+    threshold_value = Column(String(200), nullable=True)
+    
+    # Description
+    description = Column(Text, nullable=True)
+    description_hi = Column(Text, nullable=True)
+    
+    # Applicability
+    applicable_states = Column(JSON, nullable=True)
+    applicable_districts = Column(JSON, nullable=True)
+    applicable_legal_issues = Column(JSON, nullable=True)
+    
+    # Priority and weight
+    priority = Column(Integer, nullable=False, default=0)
+    weight = Column(Float, nullable=False, default=1.0)
+    
+    # Metadata
+    is_active = Column(Boolean, nullable=False, default=True)
+    
+    # Verification
+    verification_status = Column(String(20), nullable=False, default=VerificationStatusEnum.PENDING)
+    source_url = Column(String(1000), nullable=True)
+    
+    # Timestamps
+    effective_from = Column(DateTime(timezone=True), nullable=True)
+    effective_until = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<EligibilityRule(program='{self.program_name}', type='{self.rule_type}')>"
+
+
+class EvidencePattern(Base):
+    """Evidence patterns for different legal issues."""
+    
+    __tablename__ = "evidence_patterns"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Pattern details
+    legal_issue = Column(String(200), nullable=False, index=True)
+    evidence_type = Column(String(100), nullable=False)
+    evidence_name = Column(String(200), nullable=False)
+    evidence_name_hi = Column(String(200), nullable=True)
+    
+    # Description
+    description = Column(Text, nullable=True)
+    description_hi = Column(Text, nullable=True)
+    
+    # Importance
+    importance = Column(String(20), nullable=False)  # "critical", "important", "helpful"
+    weight = Column(Float, nullable=False, default=1.0)
+    
+    # Examples
+    examples = Column(JSON, nullable=True)
+    
+    # Metadata
+    is_active = Column(Boolean, nullable=False, default=True)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<EvidencePattern(issue='{self.legal_issue}', type='{self.evidence_type}')>"
+
+
+class LegalResource(Base):
+    """Legal aid resources - NGOs, legal aid centers, lawyers, etc."""
+    
+    __tablename__ = "legal_resources"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Basic information
+    name = Column(String(300), nullable=False)
+    name_hi = Column(String(300), nullable=True)
+    resource_type = Column(String(50), nullable=False, index=True)
+    
+    # Description
+    description = Column(Text, nullable=True)
+    description_hi = Column(Text, nullable=True)
+    services_offered = Column(JSON, nullable=True)
+    
+    # Location
+    state = Column(String(100), nullable=False, index=True)
+    district = Column(String(100), nullable=True, index=True)
+    city = Column(String(100), nullable=True)
+    address = Column(Text, nullable=True)
+    pincode = Column(String(10), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    
+    # Contact information
+    phone = Column(String(50), nullable=True)
+    email = Column(String(255), nullable=True)
+    website = Column(String(500), nullable=True)
+    
+    # Specialization
+    specializations = Column(JSON, nullable=True)  # Legal issue types
+    languages_supported = Column(JSON, nullable=True)
+    
+    # Eligibility criteria
+    income_threshold = Column(Float, nullable=True)
+    eligible_categories = Column(JSON, nullable=True)
+    
+    # Operational details
+    operating_hours = Column(String(500), nullable=True)
+    appointment_required = Column(Boolean, nullable=True)
+    provides_free_service = Column(Boolean, nullable=False, default=True)
+    
+    # Verification
+    verification_status = Column(String(20), nullable=False, default=VerificationStatusEnum.PENDING)
+    verified_by = Column(String(200), nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Metadata
+    is_active = Column(Boolean, nullable=False, default=True)
+    last_updated_by = Column(String(200), nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<LegalResource(name='{self.name}', type='{self.resource_type}', location='{self.district}')>"
+
+===== LEGAL RESOURCE API =====
+"""
+Legal resources API endpoints.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.session import get_db
+from app.schemas.legal import LegalResourceSearch, LegalResourceResponse
+from app.services.legal_service import LegalService
+from app.core.security import require_any_role
+from app.core.logging import get_logger
+
+router = APIRouter()
+logger = get_logger(__name__)
+
+
+@router.post("/search", response_model=List[LegalResourceResponse], status_code=status.HTTP_200_OK)
+async def search_resources(
+    search_params: LegalResourceSearch,
+    db: Session = Depends(get_db)
+):
+    """
+    Search for legal resources based on criteria.
+    
+    Args:
+        search_params: Search parameters
+        db: Database session
+        
+    Returns:
+        List of matching legal resources
+    """
+    results = LegalService.search_resources(
+        db=db,
+        state=search_params.state,
+        district=search_params.district,
+        legal_issue=search_params.legal_issue,
+        resource_type=search_params.resource_type,
+        latitude=search_params.latitude,
+        longitude=search_params.longitude,
+        max_distance_km=search_params.max_distance_km,
+        limit=search_params.limit
+    )
+    
+    # Convert to response format
+    response_list = []
+    for resource, distance, match_score in results:
+        resource_dict = LegalResourceResponse.model_validate(resource).model_dump()
+        resource_dict["distance_km"] = distance
+        resource_dict["match_score"] = match_score
+        response_list.append(LegalResourceResponse(**resource_dict))
+    
+    return response_list
+
+
+@router.get("/recommend/{session_token}", response_model=List[LegalResourceResponse], status_code=status.HTTP_200_OK)
+async def get_recommendations(
+    session_token: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get recommended legal resources for a session (demo mode returns all resources).
+    
+    Args:
+        session_token: Session token
+        db: Database session
+        
+    Returns:
+        List of recommended legal resources
+    """
+    from app.models.legal import LegalResource
+    
+    # In demo mode, return all active resources with coordinates
+    resources = db.query(LegalResource).filter(
+        LegalResource.is_active == True,
+        LegalResource.latitude.isnot(None),
+        LegalResource.longitude.isnot(None)
+    ).limit(10).all()
+    
+    return [LegalResourceResponse.model_validate(r) for r in resources]
+
+
+@router.get("/{resource_id}", response_model=LegalResourceResponse, status_code=status.HTTP_200_OK)
+async def get_resource(
+    resource_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get details of a specific legal resource.
+    
+    Args:
+        resource_id: Resource ID
+        db: Database session
+        
+    Returns:
+        Resource details
+        
+    Raises:
+        HTTPException: If resource not found
+    """
+    from app.models.legal import LegalResource
+    
+    resource = db.query(LegalResource).filter(LegalResource.id == resource_id).first()
+    
+    if not resource:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Legal resource not found"
+        )
+    
+    return LegalResourceResponse.model_validate(resource)
+
+===== RESOURCE PAGE =====
+import { useEffect, useState } from 'react';
+import { useParams, Link } from 'react-router-dom';
+import { MapPin, Phone, Mail, Globe, Navigation, Filter, ArrowLeft, CheckCircle, AlertCircle, Map, List } from 'lucide-react';
+import { useAssessmentStore } from '../../store/assessmentStore';
+import { apiClient } from '../../api/client';
+import type { ResourceSearchRequest, ResourceSearchResult } from '../../types';
+import Layout from '../../components/layout/Layout';
+import LoadingSpinner from '../../components/common/LoadingSpinner';
+import ErrorMessage from '../../components/common/ErrorMessage';
+import EmptyState from '../../components/common/EmptyState';
+import Button from '../../components/common/Button';
+import ResourceMap from '../../components/map/ResourceMap';
+
+export default function Resources() {
+  const { token } = useParams<{ token: string }>();
+  const { currentAssessment, recommendedResources, isLoading, error, loadAssessment, loadRecommendedResources } = useAssessmentStore();
+  
+  
+  const [searchResults, setSearchResults] = useState<ResourceSearchResult[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [useLocation, setUseLocation] = useState(false);
+  const [location, setLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [manualLocation, setManualLocation] = useState({ state: '', district: '', pincode: '' });
+  const [showFilters, setShowFilters] = useState(false);
+  const [viewMode, setViewMode] = useState<'list' | 'map'>('list');
+
+  useEffect(() => {
+    if (token) {
+      loadAssessment(token);
+      loadRecommendedResources(token);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    setSearchResults(recommendedResources);
+  }, [recommendedResources]);
+
+  const requestLocation = () => {
+    setUseLocation(true);
+    if ('geolocation' in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setLocation({
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+          });
+        },
+        () => {
+          setSearchError('Unable to get your location. Please enter it manually.');
+          setUseLocation(false);
+        }
+      );
+    } else {
+      setSearchError('Geolocation is not supported by your browser.');
+      setUseLocation(false);
+    }
+  };
+
+  const handleSearch = async () => {
+    setIsSearching(true);
+    setSearchError(null);
+
+    const searchParams: ResourceSearchRequest = {
+      legal_domain: currentAssessment?.legal_domain,
+      ...manualLocation,
+      ...(location && { latitude: location.latitude, longitude: location.longitude }),
+    };
+
+    try {
+      const results = await apiClient.searchResources(searchParams);
+      setSearchResults(results);
+    } catch (err: any) {
+      setSearchError(err.detail || 'Failed to search resources');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const getResourceTypeLabel = (type: string) => {
+    const labels = {
+      LEGAL_AID_OFFICE: 'Legal Aid Office',
+      NGO: 'NGO',
+      PRO_BONO_LAWYER: 'Pro Bono Lawyer',
+      GOVERNMENT_SCHEME: 'Government Scheme',
+      HELPLINE: 'Helpline',
+      ONLINE_RESOURCE: 'Online Resource',
+    };
+    return labels[type as keyof typeof labels] || type;
+  };
+
+  const getResourceTypeColor = (type: string) => {
+    const colors = {
+      LEGAL_AID_OFFICE: 'bg-blue-100 text-blue-800',
+      NGO: 'bg-green-100 text-green-800',
+      PRO_BONO_LAWYER: 'bg-purple-100 text-purple-800',
+      GOVERNMENT_SCHEME: 'bg-amber-100 text-amber-800',
+      HELPLINE: 'bg-red-100 text-red-800',
+      ONLINE_RESOURCE: 'bg-slate-100 text-slate-800',
+    };
+    return colors[type as keyof typeof colors] || 'bg-slate-100 text-slate-800';
+  };
+
+  if (isLoading) {
+    return (
+      <Layout>
+        <div className="flex items-center justify-center min-h-[60vh]">
+          <div className="text-center">
+            <LoadingSpinner size="lg" className="mx-auto mb-4" />
+            <p className="text-slate-600">Loading resources...</p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (error) {
+    return (
+      <Layout>
+        <div className="max-w-4xl mx-auto py-12">
+          <ErrorMessage
+            message={error}
+            onRetry={() => token && loadRecommendedResources(token)}
+          />
+        </div>
+      </Layout>
+    );
+  }
+
+  return (
+    <Layout>
+      <div className="max-w-6xl mx-auto py-8">
+        {/* Back Link */}
+        {token && (
+          <Link 
+            to={`/results/${token}`} 
+            className="inline-flex items-center gap-2 text-blue-900 hover:text-blue-800 mb-6 font-medium"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            Back to Results
+          </Link>
+        )}
+
+        {/* Header */}
+        <div className="mb-8">
+          <h1 className="text-3xl md:text-4xl font-bold text-slate-900 mb-2">
+            Legal Resources & Services
+          </h1>
+          <p className="text-slate-600">
+            Connect with verified legal aid offices, lawyers, and support services
+          </p>
+        </div>
+
+        {/* Location & Filters */}
+        <div className="card mb-8">
+          <div className="flex flex-col md:flex-row items-start justify-between gap-4 mb-4">
+            <div className="flex-1">
+              <h3 className="font-semibold text-slate-900 mb-2">Search by Location</h3>
+              <p className="text-sm text-slate-600">Find resources near you</p>
+            </div>
+            <div className="flex gap-3">
+              {/* View Mode Toggle */}
+              <div className="inline-flex rounded-lg border border-slate-200 p-1 bg-slate-50">
+                <button
+                  onClick={() => setViewMode('list')}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                    viewMode === 'list'
+                      ? 'bg-white text-blue-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <List className="w-4 h-4" />
+                  List
+                </button>
+                <button
+                  onClick={() => setViewMode('map')}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                    viewMode === 'map'
+                      ? 'bg-white text-blue-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Map className="w-4 h-4" />
+                  Map
+                </button>
+              </div>
+              
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setShowFilters(!showFilters)}
+              >
+                <Filter className="w-4 h-4 mr-2" />
+                {showFilters ? 'Hide' : 'Show'} Filters
+              </Button>
+            </div>
+          </div>
+
+          {showFilters && (
+            <div className="space-y-4 pt-4 border-t border-slate-200">
+              <div className="flex gap-3">
+                <Button
+                  variant={useLocation ? 'primary' : 'secondary'}
+                  onClick={requestLocation}
+                  disabled={useLocation}
+                >
+                  <Navigation className="w-4 h-4 mr-2" />
+                  {useLocation ? 'Location Enabled' : 'Use My Location'}
+                </Button>
+              </div>
+
+              <div className="grid md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    State
+                  </label>
+                  <input
+                    type="text"
+                    value={manualLocation.state}
+                    onChange={(e) => setManualLocation({ ...manualLocation, state: e.target.value })}
+                    className="input"
+                    placeholder="e.g., Karnataka"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    District
+                  </label>
+                  <input
+                    type="text"
+                    value={manualLocation.district}
+                    onChange={(e) => setManualLocation({ ...manualLocation, district: e.target.value })}
+                    className="input"
+                    placeholder="e.g., Bangalore"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Pincode
+                  </label>
+                  <input
+                    type="text"
+                    value={manualLocation.pincode}
+                    onChange={(e) => setManualLocation({ ...manualLocation, pincode: e.target.value })}
+                    className="input"
+                    placeholder="e.g., 560001"
+                  />
+                </div>
+              </div>
+
+              <Button onClick={handleSearch} isLoading={isSearching}>
+                Search Resources
+              </Button>
+            </div>
+          )}
+
+          {searchError && (
+            <ErrorMessage message={searchError} className="mt-4" />
+          )}
+        </div>
+
+        {/* Resources List or Map */}
+        {searchResults.length === 0 ? (
+          <EmptyState
+            icon={MapPin}
+            title="No Resources Found"
+            description="Try adjusting your search criteria or location to find legal resources near you."
+            action={{ label: 'Show Filters', onClick: () => setShowFilters(true) }}
+          />
+        ) : viewMode === 'map' ? (
+          /* Map View */
+          <div className="space-y-6">
+            <ResourceMap
+              resources={searchResults.map(r => ({
+                ...r.resource,
+                latitude: r.resource.latitude || undefined,
+                longitude: r.resource.longitude || undefined,
+              }))}
+              userLocation={location ? { lat: location.latitude, lng: location.longitude } : undefined}
+              height="600px"
+            />
+            <div className="text-center text-sm text-slate-600">
+              <p>
+                Showing {searchResults.filter(r => r.resource.latitude && r.resource.longitude).length} of {searchResults.length} resources on map
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Some resources may not appear on the map if location data is unavailable
+              </p>
+            </div>
+          </div>
+        ) : (
+          /* List View */
+          <div className="space-y-6">
+            {searchResults.map((result) => (
+              <div key={result.resource.id} className="card hover:shadow-lg transition-shadow">
+                <div className="flex flex-col md:flex-row gap-6">
+                  {/* Main Info */}
+                  <div className="flex-1">
+                    <div className="flex items-start justify-between mb-3">
+                      <div>
+                        <h3 className="text-xl font-semibold text-slate-900 mb-2">
+                          {result.resource.name}
+                        </h3>
+                        <div className="flex flex-wrap gap-2 mb-2">
+                          <span className={`badge ${getResourceTypeColor(result.resource.resource_type)}`}>
+                            {getResourceTypeLabel(result.resource.resource_type)}
+                          </span>
+                          {result.resource.verification_status === 'VERIFIED' && (
+                            <span className="badge badge-success flex items-center gap-1">
+                              <CheckCircle className="w-3 h-3" />
+                              Verified
+                            </span>
+                          )}
+                          {result.distance_km && (
+                            <span className="badge badge-info">
+                              {result.distance_km.toFixed(1)} km away
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {result.resource.description && (
+                      <p className="text-slate-600 mb-4">{result.resource.description}</p>
+                    )}
+
+                    {/* Contact Info */}
+                    <div className="space-y-2 text-sm">
+                      {result.resource.address && (
+                        <div className="flex items-start gap-2 text-slate-700">
+                          <MapPin className="w-4 h-4 text-slate-400 flex-shrink-0 mt-0.5" />
+                          <span>
+                            {result.resource.address}, {result.resource.city}, {result.resource.state} {result.resource.pincode}
+                          </span>
+                        </div>
+                      )}
+                      {result.resource.phone && (
+                        <div className="flex items-center gap-2 text-slate-700">
+                          <Phone className="w-4 h-4 text-slate-400 flex-shrink-0" />
+                          <a href={`tel:${result.resource.phone}`} className="hover:text-blue-900">
+                            {result.resource.phone}
+                          </a>
+                        </div>
+                      )}
+                      {result.resource.email && (
+                        <div className="flex items-center gap-2 text-slate-700">
+                          <Mail className="w-4 h-4 text-slate-400 flex-shrink-0" />
+                          <a href={`mailto:${result.resource.email}`} className="hover:text-blue-900">
+                            {result.resource.email}
+                          </a>
+                        </div>
+                      )}
+                      {result.resource.website && (
+                        <div className="flex items-center gap-2 text-slate-700">
+                          <Globe className="w-4 h-4 text-slate-400 flex-shrink-0" />
+                          <a 
+                            href={result.resource.website} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="hover:text-blue-900"
+                          >
+                            Visit Website
+                          </a>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Languages */}
+                    {result.resource.languages_supported && result.resource.languages_supported.length > 0 && (
+                      <div className="mt-4 pt-4 border-t border-slate-200">
+                        <p className="text-xs text-slate-500 mb-2">Languages Supported:</p>
+                        <div className="flex flex-wrap gap-1">
+                          {result.resource.languages_supported.map((lang, idx) => (
+                            <span key={idx} className="text-xs bg-slate-100 text-slate-700 px-2 py-1 rounded">
+                              {lang}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Why Recommended */}
+                    {result.match_reasons && result.match_reasons.length > 0 && (
+                      <div className="mt-4 pt-4 border-t border-slate-200">
+                        <p className="text-sm font-semibold text-slate-900 mb-2">
+                          Why this was recommended:
+                        </p>
+                        <ul className="text-sm text-slate-600 space-y-1">
+                          {result.match_reasons.map((reason, idx) => (
+                            <li key={idx} className="flex items-start gap-2">
+                              <CheckCircle className="w-4 h-4 text-green-600 flex-shrink-0 mt-0.5" />
+                              {reason}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Help Note */}
+        <div className="card bg-blue-50 border-blue-200 mt-8">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+            <div className="text-sm text-blue-900">
+              <strong>Note:</strong> These resources are verified to the best of our knowledge. 
+              However, availability and eligibility criteria may change. Please contact the resource directly to confirm 
+              their services, operating hours, and your eligibility before visiting.
+            </div>
+          </div>
+        </div>
+      </div>
+    </Layout>
+  );
+}
+
+===== ASSESSMENT PAGE =====
+import { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Shield, AlertTriangle, Scale } from 'lucide-react';
+import { useSessionStore } from '../../store/sessionStore';
+import { useAssessmentStore } from '../../store/assessmentStore';
+import Layout from '../../components/layout/Layout';
+import ChatMessage from '../../components/chat/ChatMessage';
+import ChatInput from '../../components/chat/ChatInput';
+import TypingIndicator from '../../components/chat/TypingIndicator';
+import AssessmentProgress from '../../components/chat/AssessmentProgress';
+import LoadingSpinner from '../../components/common/LoadingSpinner';
+import ErrorMessage from '../../components/common/ErrorMessage';
+import Button from '../../components/common/Button';
+
+export default function Assessment() {
+  const navigate = useNavigate();
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [hasStarted, setHasStarted] = useState(false);
+
+  const {
+    sessionToken,
+    messages,
+    isLoading,
+    isSending,
+    error,
+    detectedDomain,
+    urgencyLevel,
+    startNewSession,
+    sendMessage,
+    loadConversation,
+    clearError,
+    clearSession,
+  } = useSessionStore();
+
+  const { loadAssessment } = useAssessmentStore();
+
+  // Initialize session
+  useEffect(() => {
+    const initSession = async () => {
+      if (!sessionToken && !hasStarted) {
+        setHasStarted(true);
+        try {
+          // Clear any stale error before starting
+          clearError();
+          await startNewSession();
+          // Don't try to load conversation immediately after creating session
+        } catch (err) {
+          console.error('Failed to start session:', err);
+        }
+      } else if (sessionToken && messages.length === 0) {
+        // Only load conversation if we have a token but no messages
+        // This handles page refresh scenarios
+        try {
+          await loadConversation();
+        } catch (err) {
+          console.error('Failed to load conversation:', err);
+          // If loading fails on refresh, start a fresh session
+          clearSession();
+          setHasStarted(false);
+        }
+      }
+    };
+
+    initSession();
+  }, [sessionToken, startNewSession, loadConversation, hasStarted, clearError, clearSession, messages.length]);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isSending]);
+
+  // Check for safety concerns
+  const hasSafetyConcern = urgencyLevel === 'POSSIBLE_IMMEDIATE_SAFETY_CONCERN';
+
+  const handleSendMessage = async (content: string) => {
+    try {
+      await sendMessage(content);
+    } catch (err) {
+      // Error handled by store
+    }
+  };
+
+  const handleViewResults = async () => {
+    if (sessionToken) {
+      await loadAssessment(sessionToken);
+      navigate(`/results/${sessionToken}`);
+    }
+  };
+
+  const handleEndSession = async () => {
+    if (sessionToken && window.confirm('Are you sure you want to end this session? Your conversation will be saved but you cannot continue it.')) {
+      try {
+        // Call backend to close session
+        await useSessionStore.getState().endSession();
+        // Clear local session
+        clearSession();
+        // Navigate to home
+        navigate('/');
+      } catch (err) {
+        console.error('Failed to end session:', err);
+      }
+    }
+  };
+
+  if (isLoading && messages.length === 0) {
+    return (
+      <Layout showFooter={false}>
+        <div className="flex items-center justify-center min-h-[60vh]">
+          <div className="text-center">
+            <LoadingSpinner size="lg" className="mx-auto mb-4" />
+            <p className="text-slate-600">Starting your assessment...</p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  return (
+    <Layout showFooter={false} maxWidth="full">
+      <div className="flex flex-col h-[calc(100vh-4rem)]">
+        {/* Progress Bar */}
+        <AssessmentProgress
+          detectedDomain={detectedDomain}
+          urgencyLevel={urgencyLevel}
+          messageCount={messages.length}
+        />
+
+        {/* Safety Warning */}
+        {hasSafetyConcern && (
+          <div className="bg-red-50 border-b border-red-200 py-4">
+            <div className="max-w-4xl mx-auto px-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-6 h-6 text-red-600 flex-shrink-0" />
+                <div>
+                  <h3 className="font-semibold text-red-900 mb-1">Immediate Safety Concern Detected</h3>
+                  <p className="text-sm text-red-800 mb-3">
+                    If you are in immediate danger, please contact emergency services right away:
+                  </p>
+                  <div className="flex flex-wrap gap-3 text-sm">
+                    <a href="tel:100" className="btn btn-danger btn-sm">
+                      Police: 100
+                    </a>
+                    <a href="tel:112" className="btn btn-danger btn-sm">
+                      Emergency: 112
+                    </a>
+                    <a href="tel:1091" className="btn btn-danger btn-sm">
+                      Women Helpline: 1091
+                    </a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Chat Messages - Court Themed */}
+        <div className="flex-1 overflow-y-auto py-6 relative" style={{
+          background: 'linear-gradient(135deg, #78350f 0%, #92400e 50%, #78350f 100%)',
+          backgroundSize: '400% 400%',
+          animation: 'courtGradient 15s ease infinite'
+        }}>
+          {/* Wood Texture Overlay */}
+          <div className="absolute inset-0 opacity-10" style={{
+            backgroundImage: `repeating-linear-gradient(
+              90deg,
+              transparent,
+              transparent 2px,
+              rgba(0,0,0,0.1) 2px,
+              rgba(0,0,0,0.1) 4px
+            )`
+          }}></div>
+          
+          {/* Court Emblem Watermark */}
+          <div className="absolute inset-0 flex items-center justify-center opacity-5">
+            <Scale className="w-96 h-96 text-amber-200" />
+          </div>
+          
+          <div className="max-w-4xl mx-auto px-4 relative z-10">
+            {/* Privacy Notice - Court Styled */}
+            <div className="mb-8 bg-gradient-to-r from-yellow-100 via-amber-50 to-yellow-100 border-2 border-amber-500 rounded-lg p-5 flex items-start gap-3 shadow-lg" style={{
+              backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 10px, rgba(180, 83, 9, 0.03) 10px, rgba(180, 83, 9, 0.03) 20px)'
+            }}>
+              <Scale className="w-6 h-6 text-amber-900 flex-shrink-0 mt-0.5" />
+              <div className="text-sm text-gray-900">
+                <strong className="font-bold block mb-1 text-amber-900">⚖️ Court Proceedings Notice</strong>
+                <span className="text-gray-800">This conversation is confidential and protected under legal privilege. 
+                Present your case freely and honestly. The court will ask clarifying questions to understand your situation and guide you toward appropriate legal remedies.</span>
+              </div>
+            </div>
+
+            {/* Error Message with Restart Option */}
+            {error && (
+              <div className="mb-6 bg-red-50 border border-red-200 rounded-lg p-6">
+                <div className="flex items-start gap-3 mb-4">
+                  <AlertTriangle className="w-6 h-6 text-red-600 flex-shrink-0" />
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-red-900 mb-1">Connection Error</h3>
+                    <p className="text-sm text-red-800">{error}</p>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <Button
+                    onClick={() => {
+                      clearSession();
+                      setHasStarted(false);
+                      window.location.reload();
+                    }}
+                    variant="primary"
+                  >
+                    Start New Assessment
+                  </Button>
+                  <Button onClick={clearError} variant="secondary">
+                    Dismiss
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Messages */}
+            {messages.map((message) => (
+              <ChatMessage key={message.id} message={message} />
+            ))}
+
+            {/* Typing Indicator */}
+            {isSending && <TypingIndicator />}
+
+            {/* View Results Option */}
+            {messages.length > 4 && !isSending && detectedDomain && (
+              <div className="mt-8 bg-white border border-slate-200 rounded-lg p-6 text-center">
+                <h3 className="font-semibold text-slate-900 mb-2">
+                  Ready to see your assessment results?
+                </h3>
+                <p className="text-sm text-slate-600 mb-4">
+                  We've gathered enough information to provide preliminary insights. 
+                  You can continue the conversation or view your results now.
+                </p>
+                <div className="flex flex-col sm:flex-row gap-3 justify-center">
+                  <Button onClick={handleViewResults} variant="primary">
+                    View Results
+                  </Button>
+                  <Button variant="secondary" disabled>
+                    Continue Conversation
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div ref={messagesEndRef} />
+          </div>
+        </div>
+
+        {/* Chat Input */}
+        <ChatInput
+          onSend={handleSendMessage}
+          disabled={isSending || hasSafetyConcern}
+          placeholder={
+            hasSafetyConcern
+              ? "Please contact emergency services if you're in immediate danger"
+              : "Describe what happened in your own words..."
+          }
+        />
+        
+        {/* End Session Button */}
+        {sessionToken && messages.length > 0 && (
+          <div className="mt-4 text-center">
+            <Button 
+              onClick={handleEndSession} 
+              variant="secondary"
+              size="sm"
+            >
+              End Session
+            </Button>
+          </div>
+        )}
+      </div>
+    </Layout>
+  );
+}
+
+===== FRONTEND TYPES =====
+// User and Authentication
+export interface User {
+  id: string;
+  email: string;
+  full_name: string;
+  phone_number?: string;
+  role: 'USER' | 'ADMIN';
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+export interface RegisterRequest {
+  email: string;
+  password: string;
+  full_name: string;
+  phone_number?: string;
+}
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  user: User;
+}
+
+// Assessment and Session
+export interface Assessment {
+  id: string;
+  user_id?: string;
+  session_token: string;
+  status: 'ACTIVE' | 'COMPLETED' | 'ABANDONED';
+  legal_domain?: string;
+  legal_issue?: string;
+  eligibility_status?: 'POTENTIALLY_ELIGIBLE' | 'MAY_BE_ELIGIBLE' | 'MORE_INFO_REQUIRED' | 'NOT_ELIGIBLE';
+  preliminary_support_level?: 'STRONG' | 'MODERATE' | 'WEAK' | 'INSUFFICIENT_INFO';
+  urgency_level?: 'NORMAL' | 'IMPORTANT' | 'URGENT' | 'POSSIBLE_IMMEDIATE_SAFETY_CONCERN';
+  justice_readiness_score?: number;
+  information_completeness?: number;
+  evidence_readiness?: number;
+  created_at: string;
+  updated_at: string;
+  facts_extracted?: Record<string, any>;
+  entities_extracted?: Record<string, any>;
+}
+
+export interface Message {
+  id: string;
+  assessment_id: string;
+  role: 'USER' | 'ASSISTANT' | 'SYSTEM';
+  content: string;
+  metadata?: Record<string, any>;
+  created_at: string;
+}
+
+export interface StartSessionResponse {
+  session_token: string;
+  assessment_id: string;
+  message: string;
+}
+
+export interface SendMessageRequest {
+  content: string;
+  metadata?: Record<string, any>;
+}
+
+export interface SendMessageResponse {
+  message_id: string;
+  assistant_reply: string;
+  assessment_updated: boolean;
+  follow_up_needed: boolean;
+}
+
+export interface Conversation {
+  assessment: Assessment;
+  messages: Message[];
+}
+
+// Eligibility
+export interface EligibilityCheck {
+  id: string;
+  assessment_id: string;
+  status: 'POTENTIALLY_ELIGIBLE' | 'MAY_BE_ELIGIBLE' | 'MORE_INFO_REQUIRED' | 'NOT_ELIGIBLE';
+  matched_rules: string[];
+  missing_information: string[];
+  explanation: string;
+  confidence_score?: number;
+  sources?: Record<string, any>;
+  created_at: string;
+}
+
+// Support Assessment
+export interface SupportAssessment {
+  id: string;
+  assessment_id: string;
+  preliminary_support_level: 'STRONG' | 'MODERATE' | 'WEAK' | 'INSUFFICIENT_INFO';
+  evidence_readiness: number;
+  information_completeness: number;
+  timeline_clarity: number;
+  jurisdiction_clarity: number;
+  issue_clarity: number;
+  consistency_score: number;
+  justice_readiness_score: number;
+  supporting_indicators: string[];
+  missing_information: string[];
+  explanation: string;
+  created_at: string;
+}
+
+// Evidence
+export interface Evidence {
+  id: string;
+  assessment_id: string;
+  evidence_type: string;
+  description: string;
+  availability_status: 'AVAILABLE' | 'MISSING' | 'UNKNOWN';
+  importance: 'CRITICAL' | 'IMPORTANT' | 'HELPFUL';
+  notes?: string;
+  created_at: string;
+}
+
+// Legal Resources
+export interface LegalResource {
+  id: string;
+  name: string;
+  resource_type: 'LEGAL_AID_OFFICE' | 'NGO' | 'PRO_BONO_LAWYER' | 'GOVERNMENT_SCHEME' | 'HELPLINE' | 'ONLINE_RESOURCE';
+  description?: string;
+  address?: string;
+  city?: string;
+  state?: string;
+  pincode?: string;
+  phone?: string;
+  email?: string;
+  website?: string;
+  latitude?: number;
+  longitude?: number;
+  languages_supported?: string[];
+  legal_domains?: string[];
+  eligibility_criteria?: Record<string, any>;
+  verification_status: 'VERIFIED' | 'PENDING' | 'UNVERIFIED';
+  is_active: boolean;
+}
+
+export interface ResourceSearchRequest {
+  legal_domain?: string;
+  state?: string;
+  district?: string;
+  pincode?: string;
+  latitude?: number;
+  longitude?: number;
+  resource_type?: string;
+  limit?: number;
+}
+
+export interface ResourceSearchResult {
+  resource: LegalResource;
+  relevance_score: number;
+  distance_km?: number;
+  match_reasons: string[];
+}
+
+// Action Plan
+export interface ActionItem {
+  id: string;
+  assessment_id: string;
+  title: string;
+  description: string;
+  priority: number;
+  status: 'PENDING' | 'IN_PROGRESS' | 'COMPLETED';
+  category?: string;
+  deadline?: string;
+  created_at: string;
+}
+
+// Admin Analytics
+export interface AdminDashboardStats {
+  total_assessments: number;
+  completed_assessments: number;
+  active_assessments: number;
+  potentially_eligible: number;
+  urgent_cases: number;
+  common_legal_domains: Array<{ domain: string; count: number }>;
+  referrals_made: number;
+}
+
+// API Error Response
+export interface ApiError {
+  detail: string;
+  status_code?: number;
+}
+
+// Common UI States
+export type LoadingState = 'idle' | 'loading' | 'success' | 'error';
+
+export interface PaginatedResponse<T> {
+  items: T[];
+  total: number;
+  page: number;
+  size: number;
+  pages: number;
+}

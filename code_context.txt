@@ -1,0 +1,3092 @@
+===== BACKEND MAIN =====
+"""
+NYAYASETU FastAPI Application
+Main application entry point.
+"""
+
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from contextlib import asynccontextmanager
+import time
+
+from app.core.config import get_settings
+from app.core.logging import setup_logging, get_logger
+from app.db.session import init_db, check_db_connection
+
+# Import API routers (will be added incrementally)
+# from app.api.v1 import auth, sessions, assessments, legal_resources
+
+settings = get_settings()
+logger = setup_logging()
+app_logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager for startup and shutdown events."""
+    # Startup
+    app_logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+    app_logger.info(f"Environment: {settings.APP_ENV}")
+    
+    # Initialize database
+    try:
+        init_db()
+        if check_db_connection():
+            app_logger.info("Database connection successful")
+        else:
+            app_logger.error("Database connection failed")
+    except Exception as e:
+        app_logger.error(f"Database initialization error: {e}")
+    
+    yield
+    
+    # Shutdown
+    app_logger.info("Shutting down application")
+
+
+# Create FastAPI application
+app = FastAPI(
+    title=settings.APP_NAME,
+    description="AI-Powered Legal Aid Discovery and Case Triage Platform",
+    version=settings.APP_VERSION,
+    debug=settings.DEBUG,
+    lifespan=lifespan,
+    docs_url="/api/docs" if settings.DEBUG else None,
+    redoc_url="/api/redoc" if settings.DEBUG else None,
+)
+
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all HTTP requests."""
+    start_time = time.time()
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Calculate duration
+    duration = time.time() - start_time
+    
+    # Log request details
+    app_logger.info(
+        f"{request.method} {request.url.path} - "
+        f"Status: {response.status_code} - "
+        f"Duration: {duration:.3f}s"
+    )
+    
+    return response
+
+
+# Exception handlers
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors."""
+    app_logger.warning(f"Validation error: {exc.errors()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "Validation Error",
+            "detail": exc.errors(),
+            "body": exc.body
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle all other exceptions."""
+    app_logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal Server Error",
+            "message": "An unexpected error occurred" if not settings.DEBUG else str(exc)
+        }
+    )
+
+
+# Root endpoints
+@app.get("/", tags=["Root"])
+async def root():
+    """
+    Root endpoint - API information.
+    """
+    return {
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "environment": settings.APP_ENV,
+        "status": "running",
+        "docs": "/api/docs" if settings.DEBUG else "disabled in production"
+    }
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """
+    Health check endpoint.
+    
+    Returns:
+        Health status of application and dependencies
+    """
+    db_status = check_db_connection()
+    
+    overall_status = "healthy" if db_status else "unhealthy"
+    
+    return {
+        "status": overall_status,
+        "version": settings.APP_VERSION,
+        "checks": {
+            "database": "connected" if db_status else "disconnected",
+            "api": "operational"
+        },
+        "timestamp": time.time()
+    }
+
+
+@app.get("/api/v1/status", tags=["Status"])
+async def api_status():
+    """
+    API status endpoint with more details.
+    """
+    return {
+        "api_version": "v1",
+        "app_version": settings.APP_VERSION,
+        "environment": settings.APP_ENV,
+        "demo_mode": settings.DEMO_MODE,
+        "features": {
+            "authentication": True,
+            "conversations": True,
+            "assessments": True,
+            "legal_resources": True,
+            "admin": True
+        }
+    }
+
+
+# Include API routers
+from app.api.v1 import auth, sessions, assessments, legal_resources
+
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(sessions.router, prefix="/api/v1/sessions", tags=["Sessions"])
+app.include_router(assessments.router, prefix="/api/v1/assessments", tags=["Assessments"])
+app.include_router(legal_resources.router, prefix="/api/v1/legal-resources", tags=["Legal Resources"])
+
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    app_logger.info(f"Starting server on {settings.HOST}:{settings.PORT}")
+    
+    uvicorn.run(
+        "app.main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.DEBUG,
+        log_level=settings.LOG_LEVEL.lower()
+    )
+
+===== DATABASE SESSION =====
+"""
+Database session management.
+Handles SQLAlchemy engine and session creation.
+"""
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from typing import Generator
+
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+# Create SQLAlchemy engine
+# Connect args for SQLite
+connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,  # Verify connections before using
+    echo=settings.DEBUG,  # Log SQL queries in debug mode
+)
+
+# Session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Base class for models
+Base = declarative_base()
+
+
+def get_db() -> Generator[Session, None, None]:
+    """
+    Dependency for getting database session.
+    
+    Yields:
+        Database session
+        
+    Usage:
+        @router.get("/items")
+        def get_items(db: Session = Depends(get_db)):
+            return db.query(Item).all()
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception as e:
+        logger.error(f"Database session error: {e}")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def init_db():
+    """
+    Initialize database (create tables).
+    Should be called on application startup.
+    """
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create database tables: {e}")
+        raise
+
+
+def check_db_connection() -> bool:
+    """
+    Check if database connection is working.
+    
+    Returns:
+        True if connection successful, False otherwise
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        return False
+
+===== DATABASE INIT =====
+"""
+Database initialization script.
+Creates initial admin user and sample data.
+"""
+
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal, engine, Base
+from app.models import *  # Import all models
+from app.core.security import get_password_hash
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def init_database():
+    """Initialize database with tables."""
+    logger.info("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created successfully")
+
+
+def create_admin_user(db: Session):
+    """Create default admin user if not exists."""
+    from app.models.admin import AdminUser
+    
+    existing_admin = db.query(AdminUser).filter(
+        AdminUser.username == "admin"
+    ).first()
+    
+    if existing_admin:
+        logger.info("Admin user already exists")
+        return
+    
+    admin = AdminUser(
+        username="admin",
+        email="admin@nyayasetu.org",
+        password_hash=get_password_hash("admin123"),  # Change in production!
+        role="super_admin",
+        full_name="System Administrator",
+        is_active=True
+    )
+    
+    db.add(admin)
+    db.commit()
+    
+    logger.info("Created default admin user (username: admin, password: admin123)")
+
+
+def create_sample_legal_resources(db: Session):
+    """Create sample legal resources."""
+    from app.models.legal import LegalResource
+    
+    # Check if resources exist
+    existing = db.query(LegalResource).first()
+    if existing:
+        logger.info("Sample legal resources already exist")
+        return
+    
+    resources = [
+        LegalResource(
+            name="Maharashtra State Legal Services Authority",
+            name_hi="महाराष्ट्र राज्य कानूनी सेवा प्राधिकरण",
+            resource_type="legal_aid_center",
+            description="State-level legal aid authority providing free legal services",
+            description_hi="मुफ्त कानूनी सेवाएं प्रदान करने वाला राज्य स्तरीय कानूनी सहायता प्राधिकरण",
+            state="Maharashtra",
+            district="Mumbai",
+            city="Mumbai",
+            address="High Court Building, Mumbai",
+            phone="+91-22-22620181",
+            email="mslsa@maharashtra.gov.in",
+            website="https://mslsa.maharashtra.gov.in",
+            specializations=["all"],
+            languages_supported=["hi", "en", "mr"],
+            provides_free_service=True,
+            is_active=True,
+            verification_status="verified"
+        ),
+        LegalResource(
+            name="Majlis Legal Centre",
+            name_hi="मजलिस कानूनी केंद्र",
+            resource_type="ngo",
+            description="NGO providing legal aid for women and marginalized communities",
+            description_hi="महिलाओं और हाशिए के समुदायों के लिए कानूनी सहायता प्रदान करने वाली एनजीओ",
+            state="Maharashtra",
+            district="Mumbai",
+            city="Mumbai",
+            address="Majlis Office, Mumbai",
+            phone="+91-22-26671789",
+            email="info@majlislaw.com",
+            website="https://www.majlislaw.com",
+            specializations=["domestic_violence", "family_law", "property"],
+            languages_supported=["hi", "en", "mr", "ur"],
+            provides_free_service=True,
+            is_active=True,
+            verification_status="verified"
+        ),
+        LegalResource(
+            name="District Legal Services Authority - Pune",
+            name_hi="जिला कानूनी सेवा प्राधिकरण - पुणे",
+            resource_type="legal_aid_center",
+            description="District-level legal aid services in Pune",
+            state="Maharashtra",
+            district="Pune",
+            city="Pune",
+            phone="+91-20-26123456",
+            specializations=["all"],
+            languages_supported=["hi", "en", "mr"],
+            provides_free_service=True,
+            is_active=True,
+            verification_status="verified"
+        )
+    ]
+    
+    for resource in resources:
+        db.add(resource)
+    
+    db.commit()
+    logger.info(f"Created {len(resources)} sample legal resources")
+
+
+def create_sample_legal_issues(db: Session):
+    """Create sample legal issues."""
+    from app.models.legal import LegalIssue
+    
+    existing = db.query(LegalIssue).first()
+    if existing:
+        logger.info("Sample legal issues already exist")
+        return
+    
+    issues = [
+        LegalIssue(
+            name="Domestic Violence",
+            name_hi="घरेलू हिंसा",
+            category="Family Law",
+            description="Issues related to domestic violence and protection",
+            description_hi="घरेलू हिंसा और सुरक्षा से संबंधित मुद्दे",
+            keywords=["violence", "abuse", "protection", "dvact"],
+            keywords_hi=["हिंसा", "दुर्व्यवहार", "सुरक्षा"],
+            is_active=True
+        ),
+        LegalIssue(
+            name="Property Dispute",
+            name_hi="संपत्ति विवाद",
+            category="Property Law",
+            description="Issues related to property rights and disputes",
+            description_hi="संपत्ति अधिकार और विवाद से संबंधित मुद्दे",
+            keywords=["property", "land", "inheritance", "dispute"],
+            keywords_hi=["संपत्ति", "भूमि", "विरासत", "विवाद"],
+            is_active=True
+        ),
+        LegalIssue(
+            name="Consumer Rights",
+            name_hi="उपभोक्ता अधिकार",
+            category="Consumer Law",
+            description="Issues related to consumer rights and protection",
+            description_hi="उपभोक्ता अधिकार और संरक्षण से संबंधित मुद्दे",
+            keywords=["consumer", "refund", "defective", "service"],
+            keywords_hi=["उपभोक्ता", "रिफंड", "दोषपूर्ण", "सेवा"],
+            is_active=True
+        )
+    ]
+    
+    for issue in issues:
+        db.add(issue)
+    
+    db.commit()
+    logger.info(f"Created {len(issues)} sample legal issues")
+
+
+def main():
+    """Main initialization function."""
+    logger.info("Starting database initialization...")
+    
+    # Create tables
+    init_database()
+    
+    # Create session
+    db = SessionLocal()
+    
+    try:
+        # Create initial data
+        create_admin_user(db)
+        create_sample_legal_resources(db)
+        create_sample_legal_issues(db)
+        
+        logger.info("Database initialization completed successfully!")
+        logger.info("\n" + "="*60)
+        logger.info("DEFAULT ADMIN CREDENTIALS:")
+        logger.info("Username: admin")
+        logger.info("Password: admin123")
+        logger.info("⚠️  CHANGE THIS PASSWORD IN PRODUCTION!")
+        logger.info("="*60)
+        
+    except Exception as e:
+        logger.error(f"Error during initialization: {e}")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
+
+===== SESSION MODEL =====
+"""
+Session and conversation models.
+"""
+
+from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Integer, JSON
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+import uuid
+import enum
+
+from app.db.session import Base
+
+
+class LanguageEnum(str, enum.Enum):
+    """Supported languages."""
+    HINDI = "hi"
+    ENGLISH = "en"
+    MARATHI = "mr"
+    TAMIL = "ta"
+    TELUGU = "te"
+
+
+class UserTypeEnum(str, enum.Enum):
+    """User types."""
+    CITIZEN = "citizen"
+    VOLUNTEER = "volunteer"
+    ADMIN = "admin"
+
+
+class MessageRoleEnum(str, enum.Enum):
+    """Message roles in conversation."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+class Session(Base):
+    """User session model."""
+    
+    __tablename__ = "sessions"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_token = Column(String(255), unique=True, nullable=False, index=True)
+    language = Column(String(10), nullable=False, default="hi")
+    user_type = Column(String(20), nullable=False, default="citizen")
+    
+    # Demographics (optional, for analytics)
+    state = Column(String(100), nullable=True)
+    district = Column(String(100), nullable=True)
+    age_group = Column(String(20), nullable=True)
+    gender = Column(String(20), nullable=True)
+    
+    # Session tracking
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    referrer = Column(String(500), nullable=True)
+    
+    # Status
+    is_active = Column(String(20), nullable=False, default="active")
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    
+    # Relationships
+    messages = relationship("ConversationMessage", back_populates="session", cascade="all, delete-orphan")
+    assessment = relationship("Assessment", back_populates="session", uselist=False)
+    
+    def __repr__(self):
+        return f"<Session(id='{self.id}', language='{self.language}', status='{self.is_active}')>"
+
+
+class ConversationMessage(Base):
+    """Conversation message model."""
+    
+    __tablename__ = "conversation_messages"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    # Message content
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    content_translated = Column(Text, nullable=True)  # English translation if original is Hindi
+    
+    # Processing metadata
+    detected_language = Column(String(10), nullable=True)
+    detected_intent = Column(String(100), nullable=True)
+    extracted_entities = Column(JSON, nullable=True)  # JSON of entities extracted by NLP
+    
+    # Token usage (for LLM calls)
+    prompt_tokens = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
+    
+    # Ordering
+    sequence = Column(Integer, nullable=False)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    
+    # Relationships
+    session = relationship("Session", back_populates="messages")
+    
+    def __repr__(self):
+        return f"<ConversationMessage(id='{self.id}', role='{self.role}', sequence={self.sequence})>"
+
+===== SESSION API =====
+"""
+Session and conversation API endpoints.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.session import get_db
+from app.schemas.session import (
+    SessionCreate,
+    SessionResponse,
+    MessageCreate,
+    MessageResponse,
+    ConversationResponse
+)
+from app.services.session_service import SessionService
+from app.services.ai_service import get_ai_service
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+router = APIRouter()
+logger = get_logger(__name__)
+settings = get_settings()
+
+
+@router.post("/start", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+async def start_session(
+    session_data: SessionCreate,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Start a new user session.
+    
+    Args:
+        session_data: Session creation data
+        request: HTTP request (for IP and user agent)
+        db: Database session
+        
+    Returns:
+        Created session with token
+    """
+    # Extract client info
+    ip_address = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+    
+    # Create session
+    new_session = SessionService.create_session(
+        db=db,
+        language=session_data.language,
+        user_type=session_data.user_type,
+        state=session_data.state,
+        district=session_data.district,
+        age_group=session_data.age_group,
+        gender=session_data.gender,
+        ip_address=ip_address,
+        user_agent=user_agent
+    )
+    
+    return SessionResponse.model_validate(new_session)
+
+
+@router.get("/{session_token}", response_model=SessionResponse, status_code=status.HTTP_200_OK)
+async def get_session(
+    session_token: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get session by token.
+    
+    Args:
+        session_token: Session token
+        db: Database session
+        
+    Returns:
+        Session details
+        
+    Raises:
+        HTTPException: If session not found or expired
+    """
+    session = SessionService.get_session_by_token(db, session_token)
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or expired"
+        )
+    
+    return SessionResponse.model_validate(session)
+
+
+@router.post("/{session_token}/messages", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
+async def add_message(
+    session_token: str,
+    message_data: MessageCreate,
+    db: Session = Depends(get_db)
+):
+    """
+    Add a user message to the conversation.
+    
+    Args:
+        session_token: Session token
+        message_data: Message content
+        db: Database session
+        
+    Returns:
+        Created message
+        
+    Raises:
+        HTTPException: If session not found
+    """
+    # Get session
+    session = SessionService.get_session_by_token(db, session_token)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or expired"
+        )
+    
+    # Add user message
+    message = SessionService.add_message(
+        db=db,
+        session_id=str(session.id),
+        role="user",
+        content=message_data.content,
+        detected_language=session.language
+    )
+    
+    # Generate AI response
+    if settings.DEMO_MODE:
+        # DEMO MODE: Enhanced keyword-based responses with specific solutions
+        user_message_lower = message_data.content.lower()
+        
+        if any(word in user_message_lower for word in ['hello', 'hi', 'namaste', 'hey', 'start']):
+            ai_response = """Namaste. I am Justice AI, the Hon'ble Court's legal assistance system. I am here to guide you through your legal concerns with the wisdom of the law.
+
+Please share the nature of your legal matter, and I shall provide you with appropriate guidance on your rights, available remedies, and the path forward under Indian law.
+
+You may ask about:
+• Employment & wage disputes
+• Tenancy & eviction issues
+• Property disputes
+• Consumer complaints
+• Family law matters
+• Any other legal concern"""
+        
+        elif any(word in user_message_lower for word in ['employer', 'salary', 'payment', 'wage', 'paid', 'employment', 'job', 'unpaid', 'work']):
+            ai_response = """The court has noted your petition regarding non-payment of wages. This is a serious violation under the Payment of Wages Act, 1936.
+
+**Your Legal Rights:**
+1. Right to receive wages within prescribed time (7th or 10th of next month)
+2. Right to file complaint for recovery of unpaid wages
+3. Right to compensation for delayed payment (up to 50% of wages)
+
+**Immediate Actions You Can Take:**
+
+**Step 1: Send Legal Notice**
+- Send written demand to employer (keep copy)
+- Mention exact amount owed and period
+- Give 15 days to respond
+
+**Step 2: File Complaint**
+File complaint with:
+- Labour Commissioner (for private sector)
+- Labour Court (if notice fails)
+- Police (if fraud/cheating suspected)
+
+**Documents Needed:**
+✓ Employment contract/appointment letter
+✓ Salary slips or bank statements
+✓ Identity proof
+✓ Any written communication with employer
+
+**Time Limit:** File within 1 year from due date of wages
+
+**Cost:** FREE through Legal Aid - You are eligible for free legal assistance
+
+**Next Step:** Visit your nearest District Legal Services Authority to file complaint. Would you like addresses of legal aid centers near you?
+
+The court can also guide you on calculating compensation and penalties your employer may face."""
+        
+        elif any(word in user_message_lower for word in ['landlord', 'rent', 'evict', 'tenant', 'house', 'lease', 'property owner']):
+            ai_response = """The court acknowledges your tenancy dispute. Such matters are governed by the Rent Control Act and state-specific tenancy laws.
+
+**Your Rights as Tenant:**
+1. Cannot be evicted without proper legal notice
+2. Right to reasonable notice period (minimum 15 days to 1 month)
+3. Right to contest eviction in Rent Control Court
+4. Protection from illegal/forceful eviction
+
+**Common Grounds for Legal Eviction:**
+- Non-payment of rent (after notice)
+- Unauthorized subletting
+- Damage to property
+- Landlord needs for self-occupation (with proof)
+
+**Your Action Plan:**
+
+**If Facing Eviction:**
+1. Check if eviction notice is legally valid
+2. Ensure all rent is paid and you have receipts
+3. Respond to notice in writing within stipulated time
+4. Contest in Rent Control Court if notice is improper
+
+**If Rent Dispute:**
+1. Pay rent through bank transfer (keep records)
+2. Send legal notice if landlord refuses rent
+3. Deposit rent in Rent Control Court
+
+**If Illegal Eviction (forced/violent):**
+1. Call police immediately (dial 100)
+2. File FIR for illegal eviction
+3. Seek injunction from Court
+
+**Documents to Gather:**
+✓ Rent agreement (written/oral proof)
+✓ All rent receipts or bank transfers
+✓ Notice received from landlord
+✓ Any messages/communication
+✓ Witness statements if applicable
+
+**Free Legal Aid Available:** You qualify for legal representation at no cost.
+
+Would you like specific guidance based on your situation? Please share:
+- Is it an eviction notice, rent dispute, or maintenance issue?
+- Do you have a written agreement?
+- Are you current on rent payments?"""
+        
+        elif any(word in user_message_lower for word in ['property', 'land', 'inheritance', 'will', 'partition', 'ancestral']):
+            ai_response = """The court has received your petition concerning property matters. Property disputes require careful legal analysis under Transfer of Property Act and succession laws.
+
+**Types of Property Disputes:**
+
+**1. Inheritance/Succession:**
+- Governed by Hindu Succession Act (for Hindus)
+- Muslim Personal Law / Christian Succession Act (for other religions)
+- Indian Succession Act for wills
+
+**2. Partition:**
+- Right to divide co-owned property
+- Equal share for legal heirs (varies by religion)
+
+**3. Ownership Dispute:**
+- Title verification required
+- Based on sale deed, possession, tax receipts
+
+**Your Course of Action:**
+
+**For Inheritance Claims:**
+1. Obtain succession certificate or legal heir certificate
+2. Verify property records at Sub-Registrar Office
+3. File partition suit if co-owners dispute
+4. Register your share after partition decree
+
+**For Title Disputes:**
+1. Collect all title documents (sale deed, tax receipts, possession proof)
+2. File suit for declaration of title
+3. Obtain prohibitory injunction if possession threatened
+4. Register final decree
+
+**For Illegal Possession:**
+1. File police complaint for trespass
+2. File suit for recovery of possession
+3. Seek temporary injunction immediately
+
+**Documents Required:**
+✓ All sale deeds and title documents
+✓ Property tax receipts
+✓ Succession certificate/will
+✓ Survey numbers and land records
+✓ Identity and address proof
+✓ Death certificates (for inheritance)
+
+**Free Legal Services:** Property disputes qualify for legal aid based on your income. Legal aid lawyers can represent you in civil court.
+
+**Timeline:** Property cases typically take 2-5 years. Mediation can resolve faster.
+
+Please share more details:
+- What type of dispute (inheritance/partition/title)?
+- Do you have title documents?
+- Is anyone in possession of the property?"""
+        
+        elif any(word in user_message_lower for word in ['consumer', 'product', 'service', 'defect', 'refund', 'shop', 'purchase', 'bought']):
+            ai_response = """The court notes your consumer complaint. The Consumer Protection Act, 2019 provides strong remedies for defective products and deficient services.
+
+**Your Consumer Rights:**
+1. Right to safety from hazardous products
+2. Right to be informed about quality, quantity, price
+3. Right to choose from variety of products
+4. Right to be heard and seek redressal
+5. Right to compensation for deficiency
+
+**Common Consumer Issues:**
+- Defective products (electronics, appliances, vehicles)
+- Deficient services (telecom, banking, restaurants)
+- Unfair trade practices
+- Misleading advertisements
+- Overcharging
+
+**Step-by-Step Solution:**
+
+**Step 1: Contact Seller/Service Provider**
+- Give written complaint (keep copy)
+- Request replacement/refund/compensation
+- Give 30 days to respond
+
+**Step 2: File Consumer Complaint**
+
+**Choose the Right Forum:**
+- **District Commission:** Claims up to ₹1 crore
+- **State Commission:** ₹1 crore to ₹10 crore  
+- **National Commission:** Above ₹10 crore
+
+**How to File:**
+1. Online: www.edaakhil.nic.in (E-Daakhil portal)
+2. Offline: Visit nearest Consumer Commission
+3. **NO LAWYER NEEDED** - You can file yourself
+4. **MINIMAL FEES** - Based on claim amount
+
+**Documents Required:**
+✓ Purchase bill/invoice
+✓ Product warranty card
+✓ Defect description with photos
+✓ Correspondence with seller
+✓ Bank statement (for payment proof)
+✓ Identity proof
+
+**Compensation You Can Claim:**
+- Full refund or replacement
+- Compensation for mental agony (₹10,000-50,000)
+- Litigation costs
+- Interest on amount
+
+**Timeline:** Consumer cases resolved within 3-5 months (faster than civil courts)
+
+**Cost:** Filing fee ranges from ₹100 to ₹5,000 depending on claim amount
+
+**Free Legal Aid:** Available if needed, but consumer forums are consumer-friendly
+
+What is the specific issue?
+- Defective product or deficient service?
+- What is the product/service and price?
+- Did you complain to seller already?"""
+        
+        elif any(word in user_message_lower for word in ['divorce', 'custody', 'maintenance', 'marriage', 'family', 'wife', 'husband', 'child']):
+            ai_response = """The court acknowledges your family law matter with sensitivity and understanding. Family matters are governed by personal laws and Family Courts Act, 1984.
+
+**Types of Family Law Cases:**
+
+**1. Divorce:**
+- Mutual consent (both agree): 6-18 months
+- Contested (disputed): 2-5 years
+- Grounds: cruelty, adultery, desertion, mental disorder
+
+**2. Maintenance:**
+- Wife can claim under Section 125 CrPC
+- Amount based on husband's income (typically 25-30%)
+- Children entitled to maintenance until age 18/21
+
+**3. Child Custody:**
+- Mother gets custody of children under 7 years
+- Best interest of child is primary concern
+- Father gets visitation rights
+
+**Your Legal Options:**
+
+**For Divorce:**
+**Mutual Consent Divorce** (if both agree):
+1. File joint petition in Family Court
+2. First motion hearing
+3. Wait 6 months (cooling period)
+4. Second motion and final decree
+5. Duration: 6-12 months
+6. Cost: ₹10,000-30,000
+
+**Contested Divorce:**
+1. File petition stating grounds
+2. Serve notice to spouse
+3. Trial with evidence
+4. Final decree
+5. Duration: 2-5 years
+
+**For Maintenance:**
+1. File application under Section 125 CrPC (for wife/children)
+2. File under Section 18 Hindu Adoption and Maintenance Act
+3. Court decides amount based on income
+4. Interim maintenance granted within 2-3 months
+
+**For Child Custody:**
+1. File custody petition (with divorce or separately)
+2. Court considers child's welfare
+3. Temporary custody during pendency
+4. Final custody in decree
+
+**Documents Needed:**
+✓ Marriage certificate
+✓ Proof of cruelty/grounds (if any)
+✓ Income proof (of both parties)
+✓ Property documents
+✓ Children's birth certificates
+✓ Police complaints (if domestic violence)
+✓ Medical records (if abuse)
+
+**Domestic Violence Act:**
+If facing violence/abuse:
+1. File complaint under Protection of Women from Domestic Violence Act
+2. Get protection order from court
+3. Claim residence rights
+4. Seek monetary relief
+5. Free legal aid available
+
+**Free Legal Services:** Family matters qualify for legal aid. Women's legal aid centers provide specialized support.
+
+**Support Services:**
+- Women helpline: 181
+- Domestic violence helpline: 1091
+- Legal aid centers in every district
+
+Please share your specific situation:
+- Seeking divorce, maintenance, or custody?
+- Is it mutual or contested?
+- Any children involved?
+- Any violence or abuse?"""
+        
+        elif any(word in user_message_lower for word in ['violence', 'abuse', 'domestic', 'beaten', 'hit', 'threat', 'harassment']):
+            ai_response = """⚠️ The court takes note of your serious situation with utmost priority. Your safety is paramount.
+
+**IMMEDIATE ACTIONS IF YOU'RE IN DANGER:**
+🚨 **Call Police: 100** (immediate help)
+📞 **Women Helpline: 181** (24x7)
+📞 **Domestic Violence Helpline: 1091**
+
+**Your Legal Rights Under Protection of Women from Domestic Violence Act, 2005:**
+
+1. **Right to Live Without Violence** - Physical, emotional, economic, or sexual abuse is illegal
+2. **Right to Residence** - Cannot be evicted from home
+3. **Right to Protection Order** - Court can order abuser to stay away
+4. **Right to Monetary Relief** - Compensation and maintenance
+5. **Right to Custody of Children**
+
+**Immediate Steps to Take:**
+
+**Step 1: Ensure Safety**
+- Leave premises if in immediate danger
+- Go to safe place (relative/friend/shelter home)
+- Call police or women helpline
+
+**Step 2: File Complaints**
+**Two Options (can do both):**
+
+**A. Police Complaint (FIR)**
+- Go to nearest police station (or call 100)
+- File FIR under IPC Section 498A (cruelty)
+- Police will arrest abuser if evidence exists
+- Get medical examination done
+
+**B. Domestic Violence Complaint**
+- File with Magistrate Court or Protection Officer
+- Get protection order within 3 days
+- Residence order (stay in home)
+- Monetary relief order
+- Custody of children
+
+**Step 3: Get Medical Treatment**
+- Visit hospital immediately
+- Get medical certificate documenting injuries
+- This is important evidence
+
+**Step 4: Seek Legal Protection**
+- Apply for protection order
+- Injunction against abuser
+- Residence rights if married
+- Maintenance and compensation
+
+**Documents to Keep Ready:**
+✓ Medical reports of injuries
+✓ Photos/videos of violence if any
+✓ Messages/emails showing threats
+✓ Witness statements
+✓ Marriage certificate
+✓ Any previous complaints filed
+
+**Free Support Services:**
+
+**Shelter Homes:** Available in every district for immediate shelter
+
+**Legal Aid:** 100% free legal assistance for domestic violence cases
+
+**One Stop Centers:** Government centers providing medical, legal, psychological support
+
+**Compensation:** You can claim:
+- Medical expenses
+- Loss of earnings
+- Mental agony compensation
+- Maintenance for you and children
+
+**No Criminal Record for Complainant:** Filing complaint will NOT give you criminal record. It's your legal right.
+
+**Timeline:** Protection orders granted within 3-7 days
+
+Are you safe right now? Do you need immediate help or information about filing complaint?
+
+**Remember:** You are not alone. The law is on your side. Help is available 24x7."""
+        
+        elif any(word in user_message_lower for word in ['police', 'arrest', 'fir', 'criminal', 'charged', 'accused', 'case']):
+            ai_response = """The court notes your criminal law matter. Let me guide you through your legal rights and options.
+
+**Your Fundamental Rights if Arrested/Accused:**
+
+1. **Right to Know Grounds of Arrest** - Police must tell you why you're arrested
+2. **Right to Lawyer** - From the moment of arrest
+3. **Right to Remain Silent** - Don't have to answer questions
+4. **Right to Bail** - For most offenses except very serious crimes
+5. **Right to Medical Examination**
+6. **Right to Be Presented Before Magistrate within 24 hours**
+
+**If You're a Suspect/Under Investigation:**
+
+**DO:**
+- Hire a lawyer immediately
+- Cooperate with investigation (with lawyer present)
+- Preserve all evidence in your favor
+- Get anticipatory bail if arrest likely
+
+**DON'T:**
+- Don't resist arrest (can worsen situation)
+- Don't sign anything without lawyer
+- Don't talk to police without lawyer
+- Don't destroy any evidence
+
+**Types of Legal Protection:**
+
+**1. Anticipatory Bail (Before Arrest)**
+- Apply to Sessions Court or High Court
+- If you fear arrest
+- Protection from arrest while you get regular bail
+
+**2. Regular Bail (After Arrest)**
+- Apply within 24 hours of arrest
+- Given for bailable offenses immediately
+- For non-bailable: after hearing
+
+**3. Quashing of FIR**
+- Apply to High Court
+- If FIR is false/malicious
+- No cognizable offense made out
+
+**How Criminal Cases Proceed:**
+
+**Stage 1: FIR & Investigation (2-6 months)**
+- FIR filed at police station
+- Police investigate and collect evidence
+- Police file charge sheet if evidence found
+
+**Stage 2: Trial Court (1-3 years)**
+- Charges framed
+- Prosecution presents evidence
+- Defense cross-examines
+- Arguments and judgment
+
+**Stage 3: Appeals** (if convicted)
+- Appeal to Sessions Court
+- Appeal to High Court
+- Appeal to Supreme Court
+
+**Your Options:**
+
+**If Falsely Accused:**
+1. File anticipatory bail immediately
+2. Gather evidence proving innocence
+3. Apply for quashing of FIR in High Court
+4. File counter-complaint if harassment
+
+**If Genuinely Involved:**
+1. Surrender before court (shows cooperation)
+2. Apply for bail
+3. Negotiate plea bargain (if eligible)
+4. Prepare defense with evidence
+
+**Documents Needed:**
+✓ Copy of FIR
+✓ Evidence in your favor
+✓ Character certificates
+✓ Employment/education proof
+✓ Medical records if applicable
+✓ Address proof for bail
+
+**Free Legal Aid:** Available for:
+- Persons with income below ₹3 lakh/year
+- SC/ST, women, children, disabled
+- Undertrials in custody
+
+**Important Sections to Know:**
+- Section 41A CrPC: Notice before arrest (for offenses <7 years)
+- Section 437 CrPC: Bail provisions
+- Section 482 CrPC: Quashing of FIR
+
+**Bail Conditions:**
+- Surrender passport
+- Regular reporting to police
+- Not leave city/country
+- Surety bond
+
+What is your specific situation?
+- Are you arrested, under investigation, or received notice?
+- What is the nature of accusation?
+- Has FIR been filed?"""
+        
+        else:
+            # Generic but helpful response
+            ai_response = """The court has received your petition and shall examine it with due consideration.
+
+To assist you effectively, please provide more specific details about your legal issue. I can help with:
+
+**Employment Issues:**
+- Non-payment of wages or salary
+- Wrongful termination
+- Workplace harassment
+
+**Property & Housing:**
+- Tenancy and eviction disputes  
+- Property ownership conflicts
+- Rent agreement issues
+
+**Consumer Problems:**
+- Defective products
+- Service deficiencies
+- Refund disputes
+
+**Family Matters:**
+- Divorce and separation
+- Child custody
+- Maintenance claims
+
+**Criminal Concerns:**
+- False accusations
+- Bail applications
+- FIR matters
+
+**Other Legal Issues:**
+- Domestic violence
+- Fraud or cheating
+- Contract disputes
+
+Please describe your situation with relevant details:
+1. What exactly happened?
+2. When did it occur?
+3. What relief or solution do you seek?
+4. What actions have you taken so far?
+
+The more specific you are, the better I can guide you through the legal process and available remedies."""
+    
+    else:
+        # FULL AI MODE: Use OpenAI for professional legal analysis
+        try:
+            ai_service = get_ai_service()
+            
+            # Get conversation history for context
+            conversation_history = SessionService.get_conversation(db, str(session.id))
+            history = [
+                {"role": msg.role, "content": msg.content}
+                for msg in conversation_history[:-1]  # Exclude the just-added user message
+            ]
+            
+            # User context for AI
+            user_context = {
+                "state": session.state or "Not specified",
+                "district": session.district or "Not specified",
+                "language": session.language
+            }
+            
+            # Check if this is a substantial case description (for strength analysis)
+            user_message = message_data.content
+            is_detailed_case = len(user_message.split()) > 30 or any(
+                indicator in user_message.lower() 
+                for indicator in ['evidence', 'document', 'proof', 'happened', 'months', 'years']
+            )
+            
+            if is_detailed_case and len(history) >= 2:
+                # This looks like a detailed case - provide strength analysis
+                logger.info(f"Performing case strength analysis for session {session.id}")
+                
+                # Extract mentioned evidence from conversation
+                evidence_keywords = ['contract', 'receipt', 'email', 'message', 'agreement', 'certificate', 'statement']
+                evidence_mentioned = [kw for kw in evidence_keywords if kw in ' '.join([h['content'] for h in history]).lower()]
+                
+                case_analysis = ai_service.analyze_case_strength(
+                    case_description=user_message,
+                    evidence_available=evidence_mentioned,
+                    user_context=user_context
+                )
+                
+                ai_response = case_analysis['analysis']
+                
+            else:
+                # Regular legal consultation response
+                ai_response = ai_service.generate_response(
+                    user_message=user_message,
+                    conversation_history=history,
+                    user_context=user_context
+                )
+            
+            logger.info(f"Generated AI legal analysis for session {session.id}")
+            
+        except Exception as e:
+            logger.error(f"AI service error: {str(e)}")
+            # Fallback response if AI fails
+            ai_response = """I apologize, but I'm experiencing technical difficulties in providing comprehensive legal analysis at this moment.
+
+For immediate assistance:
+1. Contact your nearest District Legal Services Authority
+2. Call Legal Aid Helpline: 15100
+3. Visit: https://nalsa.gov.in
+
+Please try again in a few moments, or our system will automatically retry."""
+
+    # Add assistant response
+    response = SessionService.add_message(
+        db=db,
+        session_id=str(session.id),
+        role="assistant",
+        content=ai_response,
+        detected_language=session.language
+    )
+    
+    return MessageResponse.model_validate(response)
+
+
+@router.get("/{session_token}/conversation", response_model=ConversationResponse, status_code=status.HTTP_200_OK)
+async def get_conversation(
+    session_token: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get full conversation for a session.
+    
+    Args:
+        session_token: Session token
+        db: Database session
+        
+    Returns:
+        All messages in conversation
+        
+    Raises:
+        HTTPException: If session not found
+    """
+    # Get session
+    session = SessionService.get_session_by_token(db, session_token)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or expired"
+        )
+    
+    # Get messages
+    messages = SessionService.get_conversation(db, str(session.id))
+    
+    return ConversationResponse(
+        session_id=session.id,
+        messages=[MessageResponse.model_validate(m) for m in messages],
+        total_messages=len(messages)
+    )
+
+
+@router.post("/{session_token}/close", status_code=status.HTTP_200_OK)
+async def close_session(
+    session_token: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Close/complete a session.
+    
+    Args:
+        session_token: Session token
+        db: Database session
+        
+    Returns:
+        Success message
+    """
+    # Get session
+    session = SessionService.get_session_by_token(db, session_token)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or expired"
+        )
+    
+    SessionService.close_session(db, str(session.id))
+    
+    return {"message": "Session closed successfully"}
+
+===== SESSION SERVICE =====
+"""
+Session service.
+Business logic for session and conversation management.
+"""
+
+from datetime import datetime, timedelta
+from typing import Optional, List
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+import secrets
+
+from app.models.session import Session as SessionModel, ConversationMessage, MessageRoleEnum
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+
+class SessionService:
+    """Session management service."""
+    
+    @staticmethod
+    def create_session(
+        db: Session,
+        language: str,
+        user_type: str,
+        state: Optional[str] = None,
+        district: Optional[str] = None,
+        age_group: Optional[str] = None,
+        gender: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None
+    ) -> SessionModel:
+        """
+        Create a new user session.
+        
+        Args:
+            db: Database session
+            language: User's preferred language
+            user_type: Type of user
+            state: User's state
+            district: User's district
+            age_group: Age group
+            gender: Gender
+            ip_address: IP address
+            user_agent: User agent string
+            
+        Returns:
+            Created session
+        """
+        # Generate unique session token
+        session_token = secrets.token_urlsafe(32)
+        
+        # Calculate expiration
+        expires_at = datetime.utcnow() + timedelta(hours=settings.SESSION_TTL_HOURS)
+        
+        # Create session
+        new_session = SessionModel(
+            session_token=session_token,
+            language=language,
+            user_type=user_type,
+            state=state,
+            district=district,
+            age_group=age_group,
+            gender=gender,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            expires_at=expires_at
+        )
+        
+        db.add(new_session)
+        db.commit()
+        db.refresh(new_session)
+        
+        logger.info(f"Created new session: {new_session.id} (token: {session_token[:8]}...)")
+        
+        return new_session
+    
+    @staticmethod
+    def get_session_by_token(db: Session, session_token: str) -> Optional[SessionModel]:
+        """
+        Get session by token.
+        
+        Args:
+            db: Database session
+            session_token: Session token
+            
+        Returns:
+            Session if found and valid, None otherwise
+        """
+        session = db.query(SessionModel).filter(
+            SessionModel.session_token == session_token
+        ).first()
+        
+        if not session:
+            return None
+        
+        # Check if expired
+        if session.expires_at < datetime.utcnow():
+            logger.warning(f"Expired session accessed: {session.id}")
+            return None
+        
+        return session
+    
+    @staticmethod
+    def add_message(
+        db: Session,
+        session_id: str,
+        role: str,
+        content: str,
+        content_translated: Optional[str] = None,
+        detected_language: Optional[str] = None,
+        detected_intent: Optional[str] = None,
+        extracted_entities: Optional[dict] = None
+    ) -> ConversationMessage:
+        """
+        Add a message to conversation.
+        
+        Args:
+            db: Database session
+            session_id: Session ID
+            role: Message role (user/assistant)
+            content: Message content
+            content_translated: Translated content
+            detected_language: Detected language
+            detected_intent: Detected intent
+            extracted_entities: Extracted entities
+            
+        Returns:
+            Created message
+            
+        Raises:
+            HTTPException: If session not found
+        """
+        # Get session
+        session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found"
+            )
+        
+        # Get next sequence number
+        last_message = db.query(ConversationMessage).filter(
+            ConversationMessage.session_id == session_id
+        ).order_by(ConversationMessage.sequence.desc()).first()
+        
+        next_sequence = (last_message.sequence + 1) if last_message else 1
+        
+        # Create message
+        new_message = ConversationMessage(
+            session_id=session_id,
+            role=role,
+            content=content,
+            content_translated=content_translated,
+            detected_language=detected_language,
+            detected_intent=detected_intent,
+            extracted_entities=extracted_entities,
+            sequence=next_sequence
+        )
+        
+        db.add(new_message)
+        
+        # Update session timestamp
+        session.updated_at = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(new_message)
+        
+        logger.info(f"Added message to session {session_id}: role={role}, seq={next_sequence}")
+        
+        return new_message
+    
+    @staticmethod
+    def get_conversation(db: Session, session_id: str) -> List[ConversationMessage]:
+        """
+        Get all messages in a conversation.
+        
+        Args:
+            db: Database session
+            session_id: Session ID
+            
+        Returns:
+            List of messages ordered by sequence
+        """
+        messages = db.query(ConversationMessage).filter(
+            ConversationMessage.session_id == session_id
+        ).order_by(ConversationMessage.sequence).all()
+        
+        return messages
+    
+    @staticmethod
+    def close_session(db: Session, session_id: str):
+        """
+        Close/complete a session.
+        
+        Args:
+            db: Database session
+            session_id: Session ID
+        """
+        session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+        if session:
+            session.is_active = "completed"
+            session.completed_at = datetime.utcnow()
+            db.commit()
+            logger.info(f"Closed session: {session_id}")
+
+===== AI SERVICE =====
+"""
+AI Service for legal assistance chatbot.
+Uses OpenAI GPT for intelligent legal guidance.
+"""
+
+from typing import List, Dict, Optional
+from openai import OpenAI
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+settings = get_settings()
+logger = get_logger(__name__)
+
+
+class AIService:
+    """AI service for legal chatbot using OpenAI."""
+    
+    def __init__(self):
+        """Initialize OpenAI client."""
+        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.model = settings.LLM_MODEL
+        self.max_tokens = settings.LLM_MAX_TOKENS
+        self.temperature = settings.LLM_TEMPERATURE
+        
+        # System prompt for legal AI assistant
+        self.system_prompt = """You are a Senior Legal Advisor AI for NYAYASETU, India's premier legal aid platform. You are not a casual chatbot - you are a professional legal expert with deep knowledge of Indian law.
+
+Your Role and Expertise:
+- Act as a qualified legal advisor with expertise in all areas of Indian law
+- Provide comprehensive legal analysis, not just information
+- Analyze case strength and provide winning probability assessments
+- Reference specific sections of Indian Penal Code, CrPC, Civil Procedure Code, and relevant acts
+- Consider precedents and case law in your analysis
+- Give strategic legal advice on best course of action
+
+Legal Analysis Framework:
+For every legal query, provide:
+1. **Legal Assessment**: Identify applicable laws and sections
+2. **Case Strength Analysis**: Rate as Strong/Moderate/Weak with reasoning
+3. **Winning Probability**: Provide percentage likelihood of favorable outcome
+4. **Evidence Requirements**: What evidence strengthens the case
+5. **Strategic Recommendations**: Best legal strategy and timeline
+6. **Cost-Benefit Analysis**: Estimated costs vs expected relief
+7. **Alternative Dispute Resolution**: When applicable (mediation, arbitration)
+8. **Precedents**: Cite similar cases and outcomes when relevant
+
+Case Strength Rating Criteria:
+- **STRONG (70-95% win probability)**: Clear legal grounds, solid evidence, favorable precedents, statutory protection
+- **MODERATE (40-69% win probability)**: Valid legal claim but evidence gaps, contested facts, or procedural challenges
+- **WEAK (10-39% win probability)**: Limited evidence, adverse precedents, legal technicalities against petitioner
+- **VERY WEAK (<10% win probability)**: Barred by limitation, no legal standing, or fundamental defects
+
+Professional Communication Standards:
+- Use formal legal language with Hindi/English terms where appropriate
+- Address user as "Petitioner" or "Complainant"
+- Sign off as "Legal Advisor, NYAYASETU"
+- Provide disclaimers about not replacing lawyer consultation for complex matters
+- Be empathetic but professional - users are often in distress
+- Never give false hope - be realistic about case prospects
+
+Specialized Knowledge Areas:
+- Employment & Labour Law (Payment of Wages Act, Industrial Disputes Act)
+- Tenancy & Property Law (Rent Control Acts, Transfer of Property Act)
+- Consumer Protection (Consumer Protection Act 2019)
+- Family Law (Hindu Marriage Act, Special Marriage Act, Domestic Violence Act)
+- Criminal Law (IPC, CrPC, Evidence Act)
+- Civil Procedure (CPC, Limitation Act)
+- Alternative Dispute Resolution (Arbitration Act, Mediation)
+
+Response Structure:
+Always structure responses with clear sections:
+📋 CASE SUMMARY
+⚖️ LEGAL ANALYSIS
+🎯 CASE STRENGTH: [Strong/Moderate/Weak] | Win Probability: [XX%]
+📊 THRESHOLD FACTORS
+📁 EVIDENCE REQUIRED
+⚡ STRATEGIC RECOMMENDATIONS
+💰 COST & TIMELINE
+⚠️ RISKS & CHALLENGES
+✅ NEXT STEPS
+
+Important Guidelines:
+- Assess case strength objectively based on legal merits
+- Consider jurisdiction-specific laws (state-level variations)
+- Account for practical challenges (court delays, evidence availability)
+- Highlight any limitation period concerns
+- Suggest free legal aid when income criteria met
+- Warn about frivolous litigation consequences
+- Recommend settlement when beneficial
+
+You are expected to provide analysis at the level of a practicing advocate with 10+ years experience."""
+
+    def generate_response(
+        self,
+        user_message: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        user_context: Optional[Dict[str, str]] = None
+    ) -> str:
+        """
+        Generate AI response for user's legal query.
+        
+        Args:
+            user_message: Current user message
+            conversation_history: Previous conversation (list of {role, content} dicts)
+            user_context: Additional context (state, district, language, etc.)
+            
+        Returns:
+            AI-generated response
+        """
+        try:
+            # Build messages for OpenAI
+            messages = [{"role": "system", "content": self.system_prompt}]
+            
+            # Add user context if available
+            if user_context:
+                context_str = f"User context: State: {user_context.get('state', 'Not specified')}, District: {user_context.get('district', 'Not specified')}, Language: {user_context.get('language', 'English')}"
+                messages.append({"role": "system", "content": context_str})
+            
+            # Add conversation history
+            if conversation_history:
+                for msg in conversation_history[-6:]:  # Last 6 messages for context
+                    messages.append({
+                        "role": "assistant" if msg["role"] == "assistant" else "user",
+                        "content": msg["content"]
+                    })
+            
+            # Add current user message
+            messages.append({"role": "user", "content": user_message})
+            
+            # Call OpenAI API
+            logger.info(f"Calling OpenAI API with model: {self.model}")
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature
+            )
+            
+            ai_response = response.choices[0].message.content.strip()
+            logger.info(f"AI response generated successfully ({len(ai_response)} chars)")
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error(f"Error generating AI response: {str(e)}")
+            # Fallback response if AI fails
+            return """The court acknowledges your petition. However, there appears to be a technical issue processing your request at this moment.
+
+Please try again shortly, or if the issue persists, you may:
+1. Rephrase your question
+2. Contact our support team
+3. Visit your nearest District Legal Services Authority for in-person assistance
+
+The court regrets any inconvenience caused."""
+
+    def get_legal_guidance(
+        self,
+        legal_issue: str,
+        user_details: Optional[Dict[str, str]] = None
+    ) -> str:
+        """
+        Get specific legal guidance for a known legal issue.
+        
+        Args:
+            legal_issue: Type of legal issue (employment, tenancy, property, etc.)
+            user_details: Additional user details
+            
+        Returns:
+            Tailored legal guidance
+        """
+        issue_prompts = {
+            "employment": "The user is facing an employment-related legal issue. Provide comprehensive legal analysis including case strength assessment, winning probability, applicable sections of Payment of Wages Act/Labour Laws, evidence requirements, and strategic recommendations.",
+            "tenancy": "The user has a tenancy or rent-related dispute. Analyze under Rent Control Act, assess case strength with winning probability, evidence needed, and legal strategy.",
+            "property": "The user is dealing with a property or land dispute. Provide detailed analysis under Transfer of Property Act and succession laws, case strength rating, probability assessment, and recommended legal course.",
+            "consumer": "The user has a consumer complaint. Analyze under Consumer Protection Act 2019, assess case strength, winning probability based on evidence, forum selection, and compensation quantum.",
+            "family": "The user needs guidance on family law matters. Provide analysis under applicable personal laws, assess case strength for divorce/custody/maintenance, probability of favorable outcome, and strategic advice.",
+            "domestic_violence": "The user may be facing domestic violence. Urgent analysis under Protection of Women from Domestic Violence Act with safety measures, case strength, evidence requirements, and immediate legal remedies.",
+            "criminal": "The user has questions about criminal matters. Analyze under IPC/CrPC, assess bail probability, case strength for acquittal/conviction, evidence evaluation, and defense strategy.",
+        }
+        
+        prompt = issue_prompts.get(legal_issue.lower(), "The user needs comprehensive legal analysis with case strength assessment.")
+        
+        return self.generate_response(
+            user_message=prompt,
+            user_context=user_details
+        )
+
+    def analyze_case_strength(
+        self,
+        case_description: str,
+        evidence_available: List[str],
+        user_context: Optional[Dict[str, str]] = None
+    ) -> Dict[str, any]:
+        """
+        Analyze case strength and provide detailed assessment.
+        
+        Args:
+            case_description: Description of the legal case
+            evidence_available: List of evidence/documents user has
+            user_context: User location and other context
+            
+        Returns:
+            Dictionary with strength rating, probability, and analysis
+        """
+        analysis_prompt = f"""Analyze this legal case and provide a comprehensive strength assessment:
+
+CASE DESCRIPTION:
+{case_description}
+
+AVAILABLE EVIDENCE:
+{', '.join(evidence_available) if evidence_available else 'No evidence specified yet'}
+
+Provide analysis in this exact format:
+
+📋 CASE SUMMARY: [Brief summary]
+
+⚖️ LEGAL ANALYSIS:
+[Detailed legal analysis with applicable laws and sections]
+
+🎯 CASE STRENGTH ASSESSMENT:
+Rating: [STRONG/MODERATE/WEAK/VERY WEAK]
+Win Probability: [XX%]
+Reasoning: [Why this rating]
+
+📊 THRESHOLD FACTORS:
+Favorable Factors:
+- [Factor 1]
+- [Factor 2]
+
+Adverse Factors:
+- [Factor 1]
+- [Factor 2]
+
+Critical Missing Elements:
+- [What evidence/information is needed]
+
+📁 EVIDENCE STRENGTH ANALYSIS:
+Current Evidence: [Strong/Moderate/Weak]
+Required Additional Evidence: [List]
+
+⚡ STRATEGIC RECOMMENDATIONS:
+1. [Primary strategy]
+2. [Alternative approach]
+3. [Settlement potential]
+
+💰 COST-BENEFIT ANALYSIS:
+Expected Costs: [Estimate]
+Potential Relief: [Estimate]
+Time Investment: [Duration]
+Recommendation: [Worth pursuing?]
+
+⚠️ RISKS & CHALLENGES:
+- [Risk 1]
+- [Risk 2]
+
+✅ IMMEDIATE NEXT STEPS:
+1. [Action 1]
+2. [Action 2]
+3. [Action 3]"""
+
+        try:
+            response = self.generate_response(
+                user_message=analysis_prompt,
+                user_context=user_context
+            )
+            
+            # Extract key metrics from response (simplified extraction)
+            strength_rating = "MODERATE"  # Default
+            win_probability = 50  # Default
+            
+            # Try to extract from response
+            if "STRONG" in response and "Win Probability:" in response:
+                if "70-95%" in response or any(str(i) + "%" in response for i in range(70, 96)):
+                    strength_rating = "STRONG"
+                    win_probability = 80
+            elif "WEAK" in response:
+                strength_rating = "WEAK"
+                win_probability = 30
+            
+            return {
+                "analysis": response,
+                "strength_rating": strength_rating,
+                "win_probability": win_probability,
+                "recommendation": "Proceed with case" if win_probability >= 50 else "Consider settlement or alternative resolution"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in case strength analysis: {str(e)}")
+            return {
+                "analysis": "Unable to complete detailed analysis. Please consult with a legal professional.",
+                "strength_rating": "UNKNOWN",
+                "win_probability": 0,
+                "recommendation": "Seek professional legal consultation"
+            }
+
+
+# Singleton instance
+_ai_service_instance = None
+
+
+def get_ai_service() -> AIService:
+    """Get or create AI service singleton instance."""
+    global _ai_service_instance
+    if _ai_service_instance is None:
+        _ai_service_instance = AIService()
+    return _ai_service_instance
+
+===== LEGAL SERVICE =====
+"""
+Legal service.
+Business logic for legal resources and matching.
+"""
+
+from typing import List, Optional, Tuple
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+import math
+
+from app.models.legal import LegalResource, ResourceTypeEnum
+from app.models.assessment import Assessment, AssessmentResource
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class LegalService:
+    """Legal resource management and matching service."""
+    
+    @staticmethod
+    def search_resources(
+        db: Session,
+        state: str,
+        district: Optional[str] = None,
+        legal_issue: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+        max_distance_km: float = 50.0,
+        limit: int = 10
+    ) -> List[Tuple[LegalResource, Optional[float], Optional[float]]]:
+        """
+        Search for legal resources based on criteria.
+        
+        Args:
+            db: Database session
+            state: State to search in
+            district: District to filter by
+            legal_issue: Legal issue to match
+            resource_type: Type of resource
+            latitude: User latitude for distance calculation
+            longitude: User longitude for distance calculation
+            max_distance_km: Maximum distance in km
+            limit: Maximum results
+            
+        Returns:
+            List of tuples (resource, distance_km, match_score)
+        """
+        query = db.query(LegalResource).filter(
+            LegalResource.is_active == True,
+            LegalResource.state == state
+        )
+        
+        # Filter by district if provided
+        if district:
+            query = query.filter(LegalResource.district == district)
+        
+        # Filter by resource type
+        if resource_type:
+            query = query.filter(LegalResource.resource_type == resource_type)
+        
+        # Filter by specialization if legal issue provided
+        if legal_issue:
+            query = query.filter(
+                or_(
+                    LegalResource.specializations.contains([legal_issue]),
+                    LegalResource.specializations == None
+                )
+            )
+        
+        resources = query.all()
+        
+        # Calculate distances and match scores
+        results = []
+        for resource in resources:
+            distance = None
+            if latitude and longitude and resource.latitude and resource.longitude:
+                distance = LegalService._calculate_distance(
+                    latitude, longitude,
+                    resource.latitude, resource.longitude
+                )
+                
+                # Skip if too far
+                if distance > max_distance_km:
+                    continue
+            
+            # Calculate match score
+            match_score = LegalService._calculate_match_score(
+                resource, legal_issue, district, distance
+            )
+            
+            results.append((resource, distance, match_score))
+        
+        # Sort by match score (descending) and distance (ascending)
+        results.sort(key=lambda x: (-x[2], x[1] if x[1] else float('inf')))
+        
+        # Limit results
+        results = results[:limit]
+        
+        logger.info(f"Found {len(results)} resources for state={state}, district={district}")
+        
+        return results
+    
+    @staticmethod
+    def match_resources_to_assessment(
+        db: Session,
+        assessment_id: str,
+        limit: int = 5
+    ) -> List[AssessmentResource]:
+        """
+        Match legal resources to an assessment and save matches.
+        
+        Args:
+            db: Database session
+            assessment_id: Assessment ID
+            limit: Maximum resources to match
+            
+        Returns:
+            List of matched assessment resources
+        """
+        # Get assessment
+        assessment = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+        if not assessment:
+            logger.error(f"Assessment not found: {assessment_id}")
+            return []
+        
+        # Get session for location info
+        session = assessment.session
+        
+        # Search for resources
+        results = LegalService.search_resources(
+            db=db,
+            state=session.state or "Maharashtra",  # Default for demo
+            district=session.district,
+            legal_issue=assessment.primary_legal_issue,
+            limit=limit
+        )
+        
+        # Create assessment resource entries
+        matched_resources = []
+        for rank, (resource, distance, match_score) in enumerate(results, 1):
+            ar = AssessmentResource(
+                assessment_id=assessment_id,
+                legal_resource_id=resource.id,
+                match_score=match_score,
+                distance_km=distance,
+                rank=rank,
+                match_reason=f"Matched based on location and legal issue"
+            )
+            db.add(ar)
+            matched_resources.append(ar)
+        
+        db.commit()
+        
+        logger.info(f"Matched {len(matched_resources)} resources to assessment {assessment_id}")
+        
+        return matched_resources
+    
+    @staticmethod
+    def _calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """
+        Calculate distance between two coordinates using Haversine formula.
+        
+        Args:
+            lat1, lon1: First coordinate
+            lat2, lon2: Second coordinate
+            
+        Returns:
+            Distance in kilometers
+        """
+        R = 6371  # Earth's radius in km
+        
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        
+        a = (math.sin(dlat / 2) ** 2 +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(dlon / 2) ** 2)
+        
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        
+        return R * c
+    
+    @staticmethod
+    def _calculate_match_score(
+        resource: LegalResource,
+        legal_issue: Optional[str],
+        district: Optional[str],
+        distance: Optional[float]
+    ) -> float:
+        """
+        Calculate match score for a resource.
+        
+        Args:
+            resource: Legal resource
+            legal_issue: User's legal issue
+            district: User's district
+            distance: Distance to resource
+            
+        Returns:
+            Match score (0.0 to 1.0)
+        """
+        score = 0.5  # Base score
+        
+        # Specialization match
+        if legal_issue and resource.specializations:
+            if legal_issue in resource.specializations:
+                score += 0.3
+        
+        # District match
+        if district and resource.district == district:
+            score += 0.1
+        
+        # Distance bonus (closer is better)
+        if distance is not None:
+            if distance < 5:
+                score += 0.1
+            elif distance < 10:
+                score += 0.05
+        
+        # Free service bonus
+        if resource.provides_free_service:
+            score += 0.05
+        
+        return min(score, 1.0)
+
+===== CONFIG =====
+"""
+Application configuration management.
+Uses pydantic-settings for environment variable management.
+"""
+
+from typing import List, Optional
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, validator
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+    
+    # Application
+    APP_NAME: str = "NYAYASETU"
+    APP_VERSION: str = "1.0.0"
+    APP_ENV: str = "development"
+    DEBUG: bool = True
+    
+    # Server
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    
+    # Database
+    DATABASE_URL: str = "sqlite:///./nyayasetu.db"  # Default to SQLite
+    
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379/0"
+    
+    # Security
+    SECRET_KEY: str = "CHANGE_THIS_TO_A_RANDOM_SECRET_KEY_AT_LEAST_32_CHARS_LONG"  # Default for development
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    
+    # CORS
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8000"
+    
+    @property
+    def cors_origins(self) -> List[str]:
+        """Parse CORS origins from comma-separated string."""
+        return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",")]
+    
+    # AI Services
+    OPENAI_API_KEY: Optional[str] = None
+    LLM_MODEL: str = "gpt-3.5-turbo"
+    LLM_MAX_TOKENS: int = 500
+    LLM_TEMPERATURE: float = 0.7
+    
+    # Session Management
+    SESSION_TTL_HOURS: int = 24
+    
+    # File Upload
+    MAX_UPLOAD_SIZE_MB: int = 10
+    UPLOAD_DIR: str = "./uploads"
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    LOG_FILE: str = "logs/nyayasetu.log"
+    
+    # Demo Mode
+    DEMO_MODE: bool = False
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore"
+    )
+
+
+# Global settings instance
+settings = Settings()
+
+
+def get_settings() -> Settings:
+    """Dependency injection for settings."""
+    return settings
+
+===== FRONTEND API =====
+import axios, { AxiosError, type AxiosInstance, type InternalAxiosRequestConfig } from 'axios';
+import type {
+  AuthResponse,
+  LoginRequest,
+  RegisterRequest,
+  User,
+  StartSessionResponse,
+  SendMessageRequest,
+  SendMessageResponse,
+  Conversation,
+  Assessment,
+  EligibilityCheck,
+  SupportAssessment,
+  Evidence,
+  ResourceSearchRequest,
+  ResourceSearchResult,
+  ActionItem,
+  AdminDashboardStats,
+  ApiError,
+} from '../types';
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+
+class ApiClient {
+  private client: AxiosInstance;
+  private tokenKey = 'nyaysetu_access_token';
+
+  constructor() {
+    this.client = axios.create({
+      baseURL: API_BASE_URL,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      timeout: 30000,
+    });
+
+    // Request interceptor to add JWT token
+    this.client.interceptors.request.use(
+      (config: InternalAxiosRequestConfig) => {
+        const token = this.getToken();
+        if (token && config.headers) {
+          config.headers.Authorization = `Bearer ${token}`;
+        }
+        return config;
+      },
+      (error) => Promise.reject(error)
+    );
+
+    // Response interceptor for error handling
+    this.client.interceptors.response.use(
+      (response) => response,
+      (error: AxiosError<ApiError>) => {
+        if (error.response?.status === 401) {
+          // Token expired or invalid
+          this.clearToken();
+          window.location.href = '/login?expired=true';
+        }
+        return Promise.reject(this.handleError(error));
+      }
+    );
+  }
+
+  private handleError(error: AxiosError<ApiError>): ApiError {
+    if (error.response?.data?.detail) {
+      return {
+        detail: error.response.data.detail,
+        status_code: error.response.status,
+      };
+    }
+    if (error.message === 'Network Error') {
+      return {
+        detail: 'Unable to connect to server. Please check your internet connection.',
+        status_code: 0,
+      };
+    }
+    return {
+      detail: error.message || 'An unexpected error occurred',
+      status_code: error.response?.status,
+    };
+  }
+
+  // Token management
+  setToken(token: string): void {
+    localStorage.setItem(this.tokenKey, token);
+  }
+
+  getToken(): string | null {
+    return localStorage.getItem(this.tokenKey);
+  }
+
+  clearToken(): void {
+    localStorage.removeItem(this.tokenKey);
+  }
+
+  isAuthenticated(): boolean {
+    return !!this.getToken();
+  }
+
+  // Health check
+  async checkHealth(): Promise<{ status: string }> {
+    const response = await this.client.get('/health');
+    return response.data;
+  }
+
+  // ===== AUTHENTICATION =====
+  
+  async login(data: LoginRequest): Promise<AuthResponse> {
+    const formData = new URLSearchParams();
+    formData.append('username', data.email);
+    formData.append('password', data.password);
+
+    const response = await this.client.post<AuthResponse>('/api/v1/auth/login', formData, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+    
+    this.setToken(response.data.access_token);
+    return response.data;
+  }
+
+  async register(data: RegisterRequest): Promise<AuthResponse> {
+    const response = await this.client.post<AuthResponse>('/api/v1/auth/register', data);
+    this.setToken(response.data.access_token);
+    return response.data;
+  }
+
+  async getCurrentUser(): Promise<User> {
+    const response = await this.client.get<User>('/api/v1/auth/me');
+    return response.data;
+  }
+
+  logout(): void {
+    this.clearToken();
+  }
+
+  // ===== ASSESSMENT & CONVERSATION =====
+
+  async startSession(): Promise<StartSessionResponse> {
+    const response = await this.client.post<StartSessionResponse>('/api/v1/sessions/start', {
+      language: 'en',
+      user_type: 'citizen',
+    });
+    return response.data;
+  }
+
+  async sendMessage(sessionToken: string, data: SendMessageRequest): Promise<SendMessageResponse> {
+    const response = await this.client.post<any>(
+      `/api/v1/sessions/${sessionToken}/messages`,
+      data
+    );
+    
+    // Backend returns MessageResponse, transform to SendMessageResponse
+    return {
+      message_id: response.data.id,
+      assistant_reply: response.data.content,
+      assessment_updated: false,
+      follow_up_needed: true
+    };
+  }
+
+  async getConversation(sessionToken: string): Promise<Conversation> {
+    const response = await this.client.get<Conversation>(`/api/v1/sessions/${sessionToken}/conversation`);
+    return response.data;
+  }
+
+  async endSession(sessionToken: string): Promise<void> {
+    await this.client.post(`/api/v1/sessions/${sessionToken}/close`);
+  }
+
+  async getAssessment(sessionToken: string): Promise<Assessment> {
+    const response = await this.client.get<Assessment>(`/api/v1/assessments/${sessionToken}`);
+    return response.data;
+  }
+
+  async createAssessment(sessionToken: string): Promise<Assessment> {
+    const response = await this.client.post<Assessment>(`/api/v1/assessments/create/${sessionToken}`);
+    return response.data;
+  }
+
+  async getUserAssessments(): Promise<Assessment[]> {
+    const response = await this.client.get<Assessment[]>('/api/v1/assessments/user/me');
+    return response.data;
+  }
+
+  async deleteAssessment(assessmentId: string): Promise<void> {
+    await this.client.delete(`/api/v1/assessments/${assessmentId}`);
+  }
+
+  // ===== ELIGIBILITY =====
+
+  async getEligibility(sessionToken: string): Promise<EligibilityCheck> {
+    const response = await this.client.get<EligibilityCheck>(
+      `/api/v1/eligibility/check/${sessionToken}`
+    );
+    return response.data;
+  }
+
+  // ===== SUPPORT ASSESSMENT =====
+
+  async getSupportAssessment(sessionToken: string): Promise<SupportAssessment> {
+    const response = await this.client.get<SupportAssessment>(
+      `/api/v1/support/assess/${sessionToken}`
+    );
+    return response.data;
+  }
+
+  // ===== EVIDENCE =====
+
+  async getEvidence(assessmentId: string): Promise<Evidence[]> {
+    const response = await this.client.get<Evidence[]>(`/api/v1/evidence/assessment/${assessmentId}`);
+    return response.data;
+  }
+
+  async uploadDocument(assessmentId: string, file: File): Promise<{ document_id: string }> {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await this.client.post<{ document_id: string }>(
+      `/api/v1/evidence/upload/${assessmentId}`,
+      formData,
+      {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      }
+    );
+    return response.data;
+  }
+
+  // ===== LEGAL RESOURCES =====
+
+  async searchResources(params: ResourceSearchRequest): Promise<ResourceSearchResult[]> {
+    const response = await this.client.post<ResourceSearchResult[]>(
+      '/api/v1/legal-resources/search',
+      params
+    );
+    return response.data;
+  }
+
+  async getResourceRecommendations(sessionToken: string): Promise<ResourceSearchResult[]> {
+    const response = await this.client.get<LegalResource[]>(
+      `/api/v1/legal-resources/recommend/${sessionToken}`
+    );
+    // Transform flat resources into ResourceSearchResult format
+    return response.data.map(resource => ({
+      resource,
+      relevance_score: 0.8,
+      match_reasons: ['Located in your area', 'Provides free legal services']
+    }));
+  }
+
+  // ===== ACTION PLAN =====
+
+  async getActionPlan(assessmentId: string): Promise<ActionItem[]> {
+    const response = await this.client.get<ActionItem[]>(`/api/v1/actions/plan/${assessmentId}`);
+    return response.data;
+  }
+
+  async updateActionItem(itemId: string, status: 'PENDING' | 'IN_PROGRESS' | 'COMPLETED'): Promise<ActionItem> {
+    const response = await this.client.patch<ActionItem>(`/api/v1/actions/${itemId}`, { status });
+    return response.data;
+  }
+
+  // ===== ADMIN =====
+
+  async getAdminDashboard(): Promise<AdminDashboardStats> {
+    const response = await this.client.get<AdminDashboardStats>('/api/v1/admin/dashboard');
+    return response.data;
+  }
+
+  async getAllAssessments(): Promise<Assessment[]> {
+    const response = await this.client.get<Assessment[]>('/api/v1/admin/assessments');
+    return response.data;
+  }
+
+  async getAllUsers(): Promise<User[]> {
+    const response = await this.client.get<User[]>('/api/v1/admin/users');
+    return response.data;
+  }
+}
+
+export const apiClient = new ApiClient();
+export default apiClient;
+
+===== SESSION STORE =====
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import type { Message, SendMessageRequest } from '../types';
+import { apiClient } from '../api/client';
+
+interface SessionState {
+  sessionToken: string | null;
+  assessmentId: string | null;
+  messages: Message[];
+  isLoading: boolean;
+  isSending: boolean;
+  error: string | null;
+  detectedDomain: string | null;
+  urgencyLevel: string | null;
+  
+  // Actions
+  startNewSession: () => Promise<void>;
+  sendMessage: (content: string, metadata?: Record<string, any>) => Promise<void>;
+  loadConversation: () => Promise<void>;
+  endSession: () => Promise<void>;
+  clearSession: () => void;
+  clearError: () => void;
+}
+
+export const useSessionStore = create<SessionState>()(
+  persist(
+    (set, get) => ({
+      sessionToken: null,
+      assessmentId: null,
+      messages: [],
+      isLoading: false,
+      isSending: false,
+      error: null,
+      detectedDomain: null,
+      urgencyLevel: null,
+
+      startNewSession: async () => {
+        set({ isLoading: true, error: null });
+        try {
+          const response = await apiClient.startSession();
+          
+          // Create a welcome message if none provided by backend
+          const welcomeMessage = response.message || "Namaste. I am the Hon'ble Court. Please describe your legal matter in detail, and I shall guide you through the process of seeking justice. What brings you to this court today?";
+          
+          // Add the initial system message
+          const systemMessage: Message = {
+            id: 'initial',
+            assessment_id: response.assessment_id || '',
+            role: 'ASSISTANT',
+            content: welcomeMessage,
+            created_at: new Date().toISOString(),
+          };
+
+          set({
+            sessionToken: response.session_token,
+            assessmentId: response.assessment_id || null,
+            messages: [systemMessage],
+            isLoading: false,
+            error: null,
+          });
+        } catch (error: any) {
+          set({
+            error: error.detail || 'Failed to start session',
+            isLoading: false,
+          });
+          throw error;
+        }
+      },
+
+      sendMessage: async (content: string, metadata?: Record<string, any>) => {
+        const { sessionToken } = get();
+        if (!sessionToken) {
+          set({ error: 'No active session' });
+          return;
+        }
+
+        set({ isSending: true, error: null });
+
+        // Optimistically add user message
+        const userMessage: Message = {
+          id: `temp-${Date.now()}`,
+          assessment_id: get().assessmentId || '',
+          role: 'USER',
+          content,
+          metadata,
+          created_at: new Date().toISOString(),
+        };
+
+        set(state => ({
+          messages: [...state.messages, userMessage],
+        }));
+
+        try {
+          const request: SendMessageRequest = { content, metadata };
+          const response = await apiClient.sendMessage(sessionToken, request);
+
+          // Add assistant reply
+          const assistantMessage: Message = {
+            id: response.message_id,
+            assessment_id: get().assessmentId || '',
+            role: 'ASSISTANT',
+            content: response.assistant_reply,
+            created_at: new Date().toISOString(),
+          };
+
+          set(state => ({
+            messages: [...state.messages, assistantMessage],
+            isSending: false,
+            error: null,
+          }));
+
+          // If assessment was updated, reload it to get new metadata
+          if (response.assessment_updated) {
+            await get().loadConversation();
+          }
+        } catch (error: any) {
+          // Remove optimistic user message on error
+          set(state => ({
+            messages: state.messages.filter(m => m.id !== userMessage.id),
+            error: error.detail || 'Failed to send message',
+            isSending: false,
+          }));
+          throw error;
+        }
+      },
+
+      loadConversation: async () => {
+        const { sessionToken } = get();
+        if (!sessionToken) return;
+
+        set({ isLoading: true, error: null });
+        try {
+          const conversation = await apiClient.getConversation(sessionToken);
+          
+          // Only update if there are actual messages from the backend
+          if (conversation.messages && conversation.messages.length > 0) {
+            set({
+              messages: conversation.messages,
+              assessmentId: conversation.assessment?.id || null,
+              detectedDomain: conversation.assessment?.legal_domain || null,
+              urgencyLevel: conversation.assessment?.urgency_level || null,
+              isLoading: false,
+              error: null,
+            });
+          } else {
+            // No messages yet, keep the welcome message we created
+            set({
+              assessmentId: conversation.assessment?.id || null,
+              detectedDomain: conversation.assessment?.legal_domain || null,
+              urgencyLevel: conversation.assessment?.urgency_level || null,
+              isLoading: false,
+              error: null,
+            });
+          }
+        } catch (error: any) {
+          // Don't show error if it's just that there are no messages yet
+          console.log('Conversation load skipped:', error);
+          set({
+            isLoading: false,
+            // Don't set error here, keep the session active
+          });
+        }
+      },
+
+      endSession: async () => {
+        const token = get().sessionToken;
+        if (!token) return;
+
+        try {
+          await apiClient.endSession(token);
+          // Session closed on backend
+        } catch (error: any) {
+          console.error('Failed to end session on backend:', error);
+          // Still clear locally even if backend fails
+        }
+      },
+
+      clearSession: () => {
+        set({
+          sessionToken: null,
+          assessmentId: null,
+          messages: [],
+          error: null,
+          detectedDomain: null,
+          urgencyLevel: null,
+        });
+      },
+
+      clearError: () => set({ error: null }),
+    }),
+    {
+      name: 'nyaysetu-session',
+      partialize: (state) => ({
+        sessionToken: state.sessionToken,
+        assessmentId: state.assessmentId,
+        messages: state.messages,
+        detectedDomain: state.detectedDomain,
+        urgencyLevel: state.urgencyLevel,
+      }),
+    }
+  )
+);
+
+===== FRONTEND APP =====
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { useEffect } from 'react';
+import { useAuthStore } from './store/authStore';
+
+// Citizen Pages
+import Landing from './pages/citizen/Landing';
+import Login from './pages/citizen/Login';
+import Register from './pages/citizen/Register';
+import Assessment from './pages/citizen/Assessment';
+import Results from './pages/citizen/Results';
+import Eligibility from './pages/citizen/Eligibility';
+import Evidence from './pages/citizen/Evidence';
+import ActionPlan from './pages/citizen/ActionPlan';
+import Resources from './pages/citizen/Resources';
+import SavedAssessments from './pages/citizen/SavedAssessments';
+import About from './pages/citizen/About';
+import Privacy from './pages/citizen/Privacy';
+
+// Admin Pages
+import AdminDashboard from './pages/admin/Dashboard';
+
+// Components
+import ProtectedRoute from './components/common/ProtectedRoute';
+
+function App() {
+  const { isAuthenticated, fetchCurrentUser } = useAuthStore();
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      fetchCurrentUser();
+    }
+  }, []);
+
+  return (
+    <BrowserRouter>
+      <Routes>
+        {/* Public Routes */}
+        <Route path="/" element={<Landing />} />
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
+        <Route path="/about" element={<About />} />
+        <Route path="/privacy" element={<Privacy />} />
+        
+        {/* Assessment Routes (Public) */}
+        <Route path="/assessment" element={<Assessment />} />
+        <Route path="/results/:token" element={<Results />} />
+        <Route path="/eligibility/:token" element={<Eligibility />} />
+        <Route path="/evidence/:token" element={<Evidence />} />
+        <Route path="/action-plan/:token" element={<ActionPlan />} />
+        <Route path="/resources" element={<Resources />} />
+        <Route path="/resources/:token" element={<Resources />} />
+
+        {/* Protected Citizen Routes */}
+        <Route
+          path="/assessments"
+          element={
+            <ProtectedRoute>
+              <SavedAssessments />
+            </ProtectedRoute>
+          }
+        />
+
+        {/* Protected Admin Routes */}
+        <Route
+          path="/admin"
+          element={
+            <ProtectedRoute requireAdmin>
+              <AdminDashboard />
+            </ProtectedRoute>
+          }
+        />
+
+        {/* Catch All - Redirect to Home */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+export default App;
+
+===== MAP COMPONENT =====
+import { useEffect, useRef } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
+import { LatLngExpression, Icon } from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import { MapPin, Phone, Mail, ExternalLink } from 'lucide-react';
+
+// Fix for default marker icons in React-Leaflet
+import icon from 'leaflet/dist/images/marker-icon.png';
+import iconShadow from 'leaflet/dist/images/marker-shadow.png';
+import iconRetina from 'leaflet/dist/images/marker-icon-2x.png';
+
+const DefaultIcon = new Icon({
+  iconUrl: icon,
+  iconRetinaUrl: iconRetina,
+  shadowUrl: iconShadow,
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+  popupAnchor: [1, -34],
+  shadowSize: [41, 41]
+});
+
+interface Resource {
+  id: number;
+  name: string;
+  type: string;
+  address: string;
+  city: string;
+  state: string;
+  pincode: string;
+  phone?: string;
+  email?: string;
+  website?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
+interface ResourceMapProps {
+  resources: Resource[];
+  center?: LatLngExpression;
+  zoom?: number;
+  height?: string;
+  userLocation?: { lat: number; lng: number };
+}
+
+// Component to fit map bounds to show all markers
+function FitBounds({ resources }: { resources: Resource[] }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (resources.length > 0) {
+      const validCoords = resources
+        .filter(r => r.latitude && r.longitude)
+        .map(r => [r.latitude!, r.longitude!] as LatLngExpression);
+
+      if (validCoords.length > 0) {
+        const bounds = validCoords as [number, number][];
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 13 });
+      }
+    }
+  }, [resources, map]);
+
+  return null;
+}
+
+export default function ResourceMap({ 
+  resources, 
+  center = [20.5937, 78.9629], // Center of India
+  zoom = 5,
+  height = '500px',
+  userLocation
+}: ResourceMapProps) {
+  const mapRef = useRef(null);
+
+  // Filter resources that have valid coordinates
+  const mappableResources = resources.filter(
+    r => r.latitude && r.longitude && 
+         !isNaN(r.latitude) && !isNaN(r.longitude)
+  );
+
+  if (mappableResources.length === 0) {
+    return (
+      <div 
+        className="bg-slate-100 rounded-lg border-2 border-dashed border-slate-300 flex items-center justify-center"
+        style={{ height }}
+      >
+        <div className="text-center p-8">
+          <MapPin className="w-12 h-12 text-slate-400 mx-auto mb-3" />
+          <h3 className="text-lg font-semibold text-slate-700 mb-2">
+            Location Data Unavailable
+          </h3>
+          <p className="text-sm text-slate-500">
+            The selected resources don't have location coordinates.<br />
+            Please try a different search or location.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg overflow-hidden shadow-lg border border-slate-200">
+      <MapContainer
+        center={center}
+        zoom={zoom}
+        style={{ height, width: '100%' }}
+        ref={mapRef}
+      >
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+
+        {/* User Location Marker */}
+        {userLocation && (
+          <Marker
+            position={[userLocation.lat, userLocation.lng]}
+            icon={new Icon({
+              iconUrl: 'data:image/svg+xml;base64,' + btoa(`
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#3b82f6" width="32" height="32">
+                  <circle cx="12" cy="12" r="10" stroke="white" stroke-width="2"/>
+                  <circle cx="12" cy="12" r="4" fill="white"/>
+                </svg>
+              `),
+              iconSize: [32, 32],
+              iconAnchor: [16, 16],
+              popupAnchor: [0, -16],
+            })}
+          >
+            <Popup>
+              <div className="text-center p-2">
+                <strong className="text-blue-900">Your Location</strong>
+              </div>
+            </Popup>
+          </Marker>
+        )}
+
+        {/* Resource Markers */}
+        {mappableResources.map((resource) => (
+          <Marker
+            key={resource.id}
+            position={[resource.latitude!, resource.longitude!]}
+            icon={DefaultIcon}
+          >
+            <Popup maxWidth={300}>
+              <div className="p-2">
+                <h3 className="font-bold text-base text-slate-900 mb-2">
+                  {resource.name}
+                </h3>
+                
+                <div className="space-y-2 text-sm">
+                  <div className="flex items-start gap-2">
+                    <MapPin className="w-4 h-4 text-slate-500 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-slate-700">{resource.address}</p>
+                      <p className="text-slate-600">
+                        {resource.city}, {resource.state} - {resource.pincode}
+                      </p>
+                    </div>
+                  </div>
+
+                  {resource.phone && (
+                    <div className="flex items-center gap-2">
+                      <Phone className="w-4 h-4 text-slate-500 flex-shrink-0" />
+                      <a 
+                        href={`tel:${resource.phone}`}
+                        className="text-blue-600 hover:text-blue-800 hover:underline"
+                      >
+                        {resource.phone}
+                      </a>
+                    </div>
+                  )}
+
+                  {resource.email && (
+                    <div className="flex items-center gap-2">
+                      <Mail className="w-4 h-4 text-slate-500 flex-shrink-0" />
+                      <a 
+                        href={`mailto:${resource.email}`}
+                        className="text-blue-600 hover:text-blue-800 hover:underline break-all"
+                      >
+                        {resource.email}
+                      </a>
+                    </div>
+                  )}
+
+                  {resource.website && (
+                    <div className="flex items-center gap-2">
+                      <ExternalLink className="w-4 h-4 text-slate-500 flex-shrink-0" />
+                      <a 
+                        href={resource.website}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:text-blue-800 hover:underline break-all"
+                      >
+                        Visit Website
+                      </a>
+                    </div>
+                  )}
+
+                  <div className="mt-3 pt-2 border-t border-slate-200">
+                    <span className="inline-block px-2 py-1 text-xs font-medium bg-blue-100 text-blue-800 rounded">
+                      {resource.type}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </Popup>
+          </Marker>
+        ))}
+
+        {/* Automatically fit bounds to show all resources */}
+        <FitBounds resources={mappableResources} />
+      </MapContainer>
+    </div>
+  );
+}
+
+===== BACKEND REQUIREMENTS =====
+# FastAPI and Server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+
+# Pydantic
+pydantic==2.5.0
+pydantic-settings==2.1.0
+email-validator==2.1.0
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.1.1
+
+# Environment
+python-dotenv==1.0.0
+
+# HTTP Client
+httpx==0.25.2
+aiohttp==3.9.1
+
+# AI/LLM
+openai==1.12.0
+
+# Validation & Utilities
+phonenumbers==8.13.26
+
+# Logging
+python-json-logger==2.0.7
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.25.2
+
+# Development
+black==23.12.0
+flake8==6.1.0
+mypy==1.7.1
+
+===== FRONTEND PACKAGE =====
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.20.0",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^1.47.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-leaflet": "^5.0.0",
+    "react-router-dom": "^7.18.4",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.22",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "autoprefixer": "^10.4.17",
+    "oxlint": "^1.81.0",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}

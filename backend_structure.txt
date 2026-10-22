@@ -1,0 +1,102 @@
+Folder PATH listing for volume Windows
+Volume serial number is 2220-8911
+C:\USERS\POOJA RAJAPPA\NYAYASETU\BACKEND\APP
+|   main.py
+|   __init__.py
+|   
++---api
+|   |   __init__.py
+|   |   
+|   +---v1
+|   |   |   assessments.py
+|   |   |   auth.py
+|   |   |   legal_resources.py
+|   |   |   sessions.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           assessments.cpython-312.pyc
+|   |           auth.cpython-312.pyc
+|   |           legal_resources.cpython-312.pyc
+|   |           sessions.cpython-312.pyc
+|   |           __init__.cpython-312.pyc
+|   |           
+|   \---__pycache__
+|           __init__.cpython-312.pyc
+|           
++---core
+|   |   config.py
+|   |   logging.py
+|   |   security.py
+|   |   security_old.py
+|   |   __init__.py
+|   |   
+|   \---__pycache__
+|           config.cpython-312.pyc
+|           logging.cpython-312.pyc
+|           security.cpython-312.pyc
+|           __init__.cpython-312.pyc
+|           
++---db
+|   |   init_db.py
+|   |   session.py
+|   |   __init__.py
+|   |   
+|   \---__pycache__
+|           init_db.cpython-312.pyc
+|           session.cpython-312.pyc
+|           __init__.cpython-312.pyc
+|           
++---models
+|   |   admin.py
+|   |   assessment.py
+|   |   audit.py
+|   |   legal.py
+|   |   session.py
+|   |   __init__.py
+|   |   
+|   \---__pycache__
+|           admin.cpython-312.pyc
+|           assessment.cpython-312.pyc
+|           audit.cpython-312.pyc
+|           legal.cpython-312.pyc
+|           session.cpython-312.pyc
+|           __init__.cpython-312.pyc
+|           
++---schemas
+|   |   assessment.py
+|   |   auth.py
+|   |   legal.py
+|   |   session.py
+|   |   __init__.py
+|   |   
+|   \---__pycache__
+|           assessment.cpython-312.pyc
+|           auth.cpython-312.pyc
+|           legal.cpython-312.pyc
+|           session.cpython-312.pyc
+|           __init__.cpython-312.pyc
+|           
++---services
+|   |   ai_service.py
+|   |   assessment_service.py
+|   |   auth_service.py
+|   |   legal_service.py
+|   |   session_service.py
+|   |   __init__.py
+|   |   
+|   \---__pycache__
+|           ai_service.cpython-312.pyc
+|           assessment_service.cpython-312.pyc
+|           auth_service.cpython-312.pyc
+|           legal_service.cpython-312.pyc
+|           session_service.cpython-312.pyc
+|           __init__.cpython-312.pyc
+|           
++---utils
+|       __init__.py
+|       
+\---__pycache__
+        main.cpython-312.pyc
+        __init__.cpython-312.pyc
+        

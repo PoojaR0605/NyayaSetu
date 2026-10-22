@@ -1,0 +1,79 @@
+================================================================================
+              NYAYASETU BACKEND - HOW TO RUN
+================================================================================
+
+OPTION 1: AUTOMATED INSTALL (RECOMMENDED)
+------------------------------------------
+
+Simply double-click:  install.bat
+
+Then run:  python -m app.main
+
+
+OPTION 2: MANUAL INSTALL
+-------------------------
+
+Step 1: Install Dependencies
+   python -m pip install -r requirements.txt
+
+Step 2: Create .env file
+   copy .env.example .env
+
+Step 3: Initialize Database (optional, creates sample data)
+   python -m app.db.init_db
+
+Step 4: Run Server
+   python -m app.main
+
+
+OPTION 3: USING UVICORN
+------------------------
+
+After installing dependencies:
+   python -m uvicorn app.main:app --reload
+
+
+TROUBLESHOOTING
+---------------
+
+Error: "No module named 'pydantic_settings'"
+   Solution: Run install.bat or: pip install -r requirements.txt
+
+Error: "No module named 'app'"
+   Solution: Make sure you're in the backend directory
+
+Error: "DATABASE_URL must be set"
+   Solution: Create .env file: copy .env.example .env
+
+
+VERIFY IT'S WORKING
+-------------------
+
+1. Start the server (python -m app.main)
+
+2. Open browser to: http://localhost:8000/health
+
+3. Should see: {"status":"healthy",...}
+
+4. View API docs at: http://localhost:8000/api/docs
+
+
+DEFAULT LOGIN
+-------------
+
+Username: admin
+Password: admin123
+
+(Will be created when you run: python -m app.db.init_db)
+
+
+WHAT TO DO NEXT
+----------------
+
+1. Run: install.bat
+2. Run: python -m app.db.init_db
+3. Run: python -m app.main
+4. Open: http://localhost:8000/api/docs
+
+
+================================================================================

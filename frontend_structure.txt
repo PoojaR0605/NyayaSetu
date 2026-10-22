@@ -1,0 +1,64 @@
+Folder PATH listing for volume Windows
+Volume serial number is 2220-8911
+C:\USERS\POOJA RAJAPPA\NYAYASETU\FRONTEND\SRC
+|   App.css
+|   App.tsx
+|   index.css
+|   main.tsx
+|   
++---api
+|       client.ts
+|       
++---assets
+|       hero.png
+|       react.svg
+|       vite.svg
+|       
++---components
+|   +---chat
+|   |       AssessmentProgress.tsx
+|   |       ChatInput.tsx
+|   |       ChatMessage.tsx
+|   |       TypingIndicator.tsx
+|   |       
+|   +---common
+|   |       Button.tsx
+|   |       EmptyState.tsx
+|   |       ErrorMessage.tsx
+|   |       LoadingSpinner.tsx
+|   |       ProtectedRoute.tsx
+|   |       
+|   +---layout
+|   |       Footer.tsx
+|   |       Header.tsx
+|   |       Layout.tsx
+|   |       
+|   \---map
+|           ResourceMap.tsx
+|           
++---pages
+|   +---admin
+|   |       Dashboard.tsx
+|   |       
+|   \---citizen
+|           About.tsx
+|           ActionPlan.tsx
+|           Assessment.tsx
+|           Eligibility.tsx
+|           Evidence.tsx
+|           Landing.tsx
+|           Login.tsx
+|           Privacy.tsx
+|           Register.tsx
+|           Resources.tsx
+|           Results.tsx
+|           SavedAssessments.tsx
+|           
++---store
+|       assessmentStore.ts
+|       authStore.ts
+|       sessionStore.ts
+|       
+\---types
+        index.ts
+        
