@@ -159,7 +159,6 @@ export default function NearbyLawyers() {
 
   // External directories are searched separately. Their listings are
   // not imported into NyayaSetu's own result list or map.
-  const hasSearchedLocation = Boolean(results || location.trim());
 
   const googleMapsUrl = results
     ? `https://www.google.com/maps/search/lawyers/@${results.center.lat},${results.center.lon},14z`

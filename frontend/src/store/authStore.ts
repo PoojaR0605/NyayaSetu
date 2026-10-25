@@ -1,15 +1,17 @@
+
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { User, LoginRequest, RegisterRequest } from '../types';
 import { apiClient } from '../api/client';
+import { useSessionStore } from './sessionStore';
+import { useAssessmentStore } from './assessmentStore';
 
 interface AuthState {
   user: User | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   error: string | null;
-  
-  // Actions
+
   login: (credentials: LoginRequest) => Promise<void>;
   register: (data: RegisterRequest) => Promise<void>;
   logout: () => void;
@@ -25,80 +27,122 @@ export const useAuthStore = create<AuthState>()(
       isLoading: false,
       error: null,
 
-      login: async (credentials: LoginRequest) => {
+      login: async (credentials) => {
         set({ isLoading: true, error: null });
+
         try {
           const response = await apiClient.login(credentials);
-          set({ 
-            user: response.user, 
-            isAuthenticated: true, 
+
+          // Prevent a previous account's active chat from carrying over.
+          useSessionStore.getState().clearSession();
+          useAssessmentStore.getState().clearCurrentAssessment();
+
+          set({
+            user: response.user,
+            isAuthenticated: true,
             isLoading: false,
-            error: null 
+            error: null,
           });
         } catch (error: any) {
-          set({ 
-            error: error.detail || 'Login failed', 
+          set({
+            error:
+              error?.detail ||
+              error?.message ||
+              'Login failed',
             isLoading: false,
             isAuthenticated: false,
-            user: null
+            user: null,
           });
+
           throw error;
         }
       },
 
-      register: async (data: RegisterRequest) => {
+      register: async (data) => {
         set({ isLoading: true, error: null });
+
         try {
           const response = await apiClient.register(data);
-          set({ 
-            user: response.user, 
-            isAuthenticated: true, 
+
+          useSessionStore.getState().clearSession();
+          useAssessmentStore.getState().clearCurrentAssessment();
+
+          set({
+            user: response.user,
+            isAuthenticated: true,
             isLoading: false,
-            error: null 
+            error: null,
           });
         } catch (error: any) {
-          set({ 
-            error: error.detail || 'Registration failed', 
+          set({
+            error:
+              error?.detail ||
+              error?.message ||
+              'Registration failed',
             isLoading: false,
             isAuthenticated: false,
-            user: null
+            user: null,
           });
+
           throw error;
         }
       },
 
       logout: () => {
+        // Clear the active conversation from browser state.
+        useSessionStore.getState().clearSession();
+
+        // Clear the current assessment and related data.
+        useAssessmentStore.getState().clearCurrentAssessment();
+
+        // Clear authentication credentials.
         apiClient.logout();
-        set({ 
-          user: null, 
-          isAuthenticated: false, 
-          error: null 
+
+        set({
+          user: null,
+          isAuthenticated: false,
+          isLoading: false,
+          error: null,
         });
       },
 
       fetchCurrentUser: async () => {
         if (!apiClient.isAuthenticated()) {
-          set({ user: null, isAuthenticated: false });
+          useSessionStore.getState().clearSession();
+          useAssessmentStore.getState().clearCurrentAssessment();
+
+          set({
+            user: null,
+            isAuthenticated: false,
+            isLoading: false,
+            error: null,
+          });
+
           return;
         }
 
-        set({ isLoading: true });
+        set({ isLoading: true, error: null });
+
         try {
           const user = await apiClient.getCurrentUser();
-          set({ 
-            user, 
-            isAuthenticated: true, 
+
+          set({
+            user,
+            isAuthenticated: true,
             isLoading: false,
-            error: null 
+            error: null,
           });
-        } catch (error: any) {
-          // Token might be expired
+        } catch {
           apiClient.clearToken();
-          set({ 
-            user: null, 
-            isAuthenticated: false, 
+
+          useSessionStore.getState().clearSession();
+          useAssessmentStore.getState().clearCurrentAssessment();
+
+          set({
+            user: null,
+            isAuthenticated: false,
             isLoading: false,
-            error: null 
+            error: null,
           });
         }
       },

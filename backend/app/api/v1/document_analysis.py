@@ -1,14 +1,16 @@
 
 """
-NYAYASETU document upload and preliminary AI review endpoint.
+NyayaSetu document upload and preliminary AI review endpoint.
 
-Extracts text from supported files and sends readable text to the existing
-AI service. It does not save uploaded files or verify their authenticity.
+Supported uploads: searchable PDF and UTF-8 TXT.
+Images and scanned PDFs require OCR, which is not implemented here.
+Uploaded files are processed in memory and are not persisted.
 """
 
 import io
+import logging
 import os
-from typing import Any, List
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -17,13 +19,14 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.services.ai_service import get_ai_service
 
-router = APIRouter(
-    prefix="/documents",
-    tags=["Document Analysis"],
-)
+router = APIRouter(prefix="/documents", tags=["Document Analysis"])
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+logger = logging.getLogger(__name__)
+
+MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_ANALYSIS_TEXT = 30_000
+MAX_EXTRACTED_TEXT = 100_000
+MAX_PDF_PAGES = 50
 
 ALLOWED_TYPES = {
     "application/pdf",
@@ -41,21 +44,36 @@ class DocumentReview(BaseModel):
     extracted_text: str
     review_status: str
     message: str
-    next_steps: List[str]
+    next_steps: list[str]
 
 
 def extract_pdf_text(data: bytes) -> str:
-    """Extract selectable PDF text. Scanned PDFs may require OCR."""
+    """Extract selectable text from a PDF."""
     try:
         from pypdf import PdfReader
 
         reader = PdfReader(io.BytesIO(data))
 
-        if len(reader.pages) > 50:
+        if len(reader.pages) > MAX_PDF_PAGES:
             raise HTTPException(
                 status_code=400,
-                detail="PDFs must contain no more than 50 pages.",
+                detail=f"PDFs must contain no more than {MAX_PDF_PAGES} pages.",
             )
+
+        if reader.is_encrypted:
+            try:
+                if reader.decrypt("") == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This PDF is password-protected. Upload an accessible copy.",
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unable to open the protected PDF.",
+                ) from exc
 
         parts = []
 
@@ -66,126 +84,169 @@ def extract_pdf_text(data: bytes) -> str:
 
     except HTTPException:
         raise
+    except ImportError as exc:
+        logger.exception("pypdf is not installed")
+        raise HTTPException(
+            status_code=500,
+            detail="PDF processing is unavailable. Install the pypdf dependency.",
+        ) from exc
     except Exception as exc:
+        logger.exception("PDF text extraction failed")
         raise HTTPException(
             status_code=400,
-            detail="Unable to read this PDF. Please upload a valid PDF.",
+            detail="Unable to read this PDF. Upload a valid, accessible PDF.",
         ) from exc
+
+
+def get_ai_review_text(result: Any) -> str:
+    """Accept common AI service return formats safely."""
+    if isinstance(result, str):
+        return result.strip()
+
+    if isinstance(result, dict):
+        for key in ("analysis", "response", "content", "text"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
 
 
 @router.post("/analyze", response_model=DocumentReview)
 async def analyze_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-) -> Any:
-    """
-    Extract readable text and generate a preliminary AI review.
+) -> DocumentReview:
+    """Extract text and request a preliminary AI review."""
+    del db  # This endpoint does not store files in the database.
 
-    This endpoint does not persist the file or associate it with an account.
-    """
-    # Preserve the existing dependency without implying that the file
-    # is stored in the database.
-    del db
-
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Please select a file.",
-        )
-
-    content_type = (file.content_type or "").lower()
-    filename = os.path.basename(file.filename)
-
-    if content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail="Upload a PDF, TXT, JPG, PNG, or WEBP file.",
-        )
-
-    data = await file.read(MAX_FILE_SIZE + 1)
-
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="The file exceeds the 10 MB limit.",
-        )
-
-    if not data:
-        raise HTTPException(
-            status_code=400,
-            detail="The file is empty.",
-        )
-
-    extracted_text = ""
-
-    if content_type == "application/pdf":
-        extracted_text = extract_pdf_text(data)
-
-    elif content_type == "text/plain":
-        try:
-            extracted_text = data.decode("utf-8-sig").strip()
-        except UnicodeDecodeError as exc:
+    try:
+        if not file.filename:
             raise HTTPException(
                 status_code=400,
-                detail="The text file must use UTF-8 encoding.",
-            ) from exc
+                detail="Please select a file.",
+            )
 
-    else:
-        # Image OCR has not been implemented in this endpoint.
-        extracted_text = ""
+        filename = os.path.basename(file.filename).strip()
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
 
-    # Avoid sending excessively large documents to the AI service.
-    if len(extracted_text) > 100_000:
-        extracted_text = extracted_text[:100_000]
+        if content_type not in ALLOWED_TYPES:
+            raise HTTPException(
+                status_code=415,
+                detail="Supported file types are PDF, TXT, JPG, PNG, and WEBP.",
+            )
 
-    if not extracted_text:
-        if content_type.startswith("image/") or content_type == "application/pdf":
+        # Read at most 1 byte beyond the limit to detect oversized uploads.
+        data = await file.read(MAX_FILE_SIZE + 1)
+
+        if len(data) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="The file exceeds the 10 MB upload limit.",
+            )
+
+        if not data:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty.",
+            )
+
+        # Basic signature checks help reject files whose contents do not
+        # match their declared PDF or image type.
+        if content_type == "application/pdf" and not data.startswith(b"%PDF-"):
+            raise HTTPException(
+                status_code=400,
+                detail="The file does not appear to be a valid PDF.",
+            )
+
+        image_signatures = {
+            "image/jpeg": lambda b: b.startswith(b"\xff\xd8\xff"),
+            "image/png": lambda b: b.startswith(b"\x89PNG\r\n\x1a\n"),
+            "image/webp": lambda b: (
+                len(b) >= 12
+                and b.startswith(b"RIFF")
+                and b[8:12] == b"WEBP"
+            ),
+        }
+
+        if content_type in image_signatures:
+            if not image_signatures[content_type](data):
+                raise HTTPException(
+                    status_code=400,
+                    detail="The file contents do not match the selected image type.",
+                )
+
+        if content_type == "application/pdf":
+            extracted_text = extract_pdf_text(data)
+
+        elif content_type == "text/plain":
+            try:
+                extracted_text = data.decode("utf-8-sig").strip()
+            except UnicodeDecodeError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The text file must use UTF-8 encoding.",
+                ) from exc
+
+        else:
+            # Image OCR is not implemented in this endpoint.
+            extracted_text = ""
+
+        extracted_text = extracted_text[:MAX_EXTRACTED_TEXT]
+
+        if not extracted_text:
+            is_image = content_type.startswith("image/")
             return DocumentReview(
                 filename=filename,
                 content_type=content_type,
                 size_bytes=len(data),
                 extracted_text="",
-                review_status="ocr_required",
+                review_status="ocr_required" if is_image or content_type == "application/pdf" else "no_text",
                 message=(
-                    "The file was received, but no readable text was extracted. "
-                    "Image OCR is not configured in this endpoint. Scanned PDFs "
-                    "may also require OCR. No AI evidence assessment was performed."
+                    "No readable text could be extracted. This may be a scanned "
+                    "PDF or image. OCR is not configured in this endpoint, so "
+                    "no AI document review was performed."
                 ),
                 next_steps=[
-                    "Upload a searchable PDF or UTF-8 text copy if available.",
-                    "Check that the document is readable and complete.",
-                    "Keep the original file unchanged.",
+                    "Try a searchable PDF or UTF-8 text file.",
+                    "Check that the document is clear and readable.",
+                    "Compare extracted text against the original before relying on it.",
                     "Ask a qualified lawyer to review important evidence.",
                 ],
             )
 
-        return DocumentReview(
-            filename=filename,
-            content_type=content_type,
-            size_bytes=len(data),
-            extracted_text="",
-            review_status="no_text",
-            message="No readable text was found in the file.",
-            next_steps=[
-                "Check that the file contains readable text.",
-                "Try a searchable PDF or UTF-8 text file.",
-            ],
-        )
+        # Generate a review from the actual extracted document text.
+        try:
+            ai_service = get_ai_service()
+            result = ai_service.analyze_document(
+                extracted_text=extracted_text[:MAX_ANALYSIS_TEXT],
+                case_context=None,
+            )
+            analysis = get_ai_review_text(result)
 
-    # Use the actual text extracted from this upload.
-    # A filename alone is not enough to determine legal relevance.
-    try:
-        ai_service = get_ai_service()
+            if not analysis:
+                raise RuntimeError("The AI service returned no usable review.")
 
-        review = ai_service.analyze_document(
-            extracted_text=extracted_text[:MAX_ANALYSIS_TEXT],
-            case_context=None,
-        )
+        except Exception as exc:
+            logger.exception("AI document review failed")
 
-        analysis = str(review.get("analysis") or "").strip()
-
-        if not analysis:
-            raise RuntimeError("The AI service returned an empty review.")
+            return DocumentReview(
+                filename=filename,
+                content_type=content_type,
+                size_bytes=len(data),
+                extracted_text=extracted_text,
+                review_status="text_extracted",
+                message=(
+                    "Text extraction succeeded, but the AI review failed. "
+                    "Check the backend terminal for the underlying error and "
+                    "retry after the AI service is available."
+                ),
+                next_steps=[
+                    "Check that Ollama and the configured model are running.",
+                    "Check the backend terminal for the AI service error.",
+                    "Verify the extracted text against the original document.",
+                ],
+            )
 
         return DocumentReview(
             filename=filename,
@@ -203,37 +264,11 @@ async def analyze_document(
             ),
             next_steps=[
                 "Compare the extracted text with the original document.",
-                "Check all names, dates, amounts, and quotations for accuracy.",
-                "Provide the related legal issue and relevant context for a more "
-                "focused assessment.",
-                "Preserve the original document and seek qualified legal review "
-                "where appropriate.",
+                "Check names, dates, amounts, and quotations for accuracy.",
+                "Discuss relevant facts and missing evidence with a qualified lawyer.",
+                "Preserve the original document.",
             ],
         )
 
-    except Exception:
-        # Keep successful text extraction available even if the AI provider
-        # is unavailable. Do not pretend that an AI assessment occurred.
-        from app.core.logging import get_logger
-
-        logger = get_logger(__name__)
-        logger.exception("AI document review failed for %s", filename)
-
-        return DocumentReview(
-            filename=filename,
-            content_type=content_type,
-            size_bytes=len(data),
-            extracted_text=extracted_text,
-            review_status="text_extracted",
-            message=(
-                "The document text was extracted, but AI review could not be "
-                "completed. No document-specific legal assessment was produced. "
-                "Check the backend logs and AI configuration, then try again."
-            ),
-            next_steps=[
-                "Check that the OpenAI API key and model configuration are valid.",
-                "Check the backend terminal for the AI service error.",
-                "Review the extracted text for accuracy.",
-                "Do not treat text extraction alone as an evidence assessment.",
-            ],
-        )
+    finally:
+        await file.close()

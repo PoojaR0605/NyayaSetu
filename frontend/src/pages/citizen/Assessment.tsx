@@ -1,6 +1,6 @@
 
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate, Link, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
   Scale,
@@ -41,11 +41,10 @@ interface CaseStrengthResponse {
   disclaimer?: string;
 }
 
-// Use the same base URL as the shared API client so all requests target
-// the same backend regardless of how VITE_API_BASE_URL is set.
-const API_BASE_URL =
-  (import.meta.env as Record<string, string>).VITE_API_BASE_URL ||
-  'http://localhost:8000';
+const API_BASE_URL = (
+  (import.meta.env as Record<string, string | undefined>)
+    .VITE_API_BASE_URL || 'http://localhost:8001'
+).replace(/\/+$/, '');
 
 function getApiErrorMessage(err: unknown): string {
   const error = err as {
@@ -58,14 +57,12 @@ function getApiErrorMessage(err: unknown): string {
     status_code?: number;
   };
 
-  const statusCode =
-    error.response?.status ?? error.status_code;
-
+  const statusCode = error?.response?.status ?? error?.status_code;
   const detail =
-    error.response?.data?.detail ??
-    error.response?.data?.message ??
-    error.detail ??
-    error.message;
+    error?.response?.data?.detail ??
+    error?.response?.data?.message ??
+    error?.detail ??
+    error?.message;
 
   let message =
     typeof detail === 'string'
@@ -74,13 +71,43 @@ function getApiErrorMessage(err: unknown): string {
         ? JSON.stringify(detail)
         : 'An unexpected error occurred.';
 
-  if (statusCode === 404) {
-    message = `The session or case-review endpoint was not found. ${message}`;
+  if (statusCode === 401 || statusCode === 403) {
+    message = `Authentication or permission error. ${message}`;
+  } else if (statusCode === 404) {
+    message = `The requested session or endpoint was not found. ${message}`;
+  } else if (statusCode === 413) {
+    message = `The uploaded file is too large. ${message}`;
+  } else if (statusCode === 415) {
+    message = `This file type is not supported. ${message}`;
   } else if (statusCode === 503) {
-    message = `The AI service could not generate the review. Check that Ollama is running. ${message}`;
+    message = `The AI service is unavailable. Check that Ollama and the configured model are running. ${message}`;
   }
 
   return message;
+}
+
+async function readResponseError(response: Response): Promise<string> {
+  const fallback = `Request failed with HTTP ${response.status}.`;
+
+  try {
+    const body = await response.json();
+
+    if (typeof body.detail === 'string') {
+      return body.detail;
+    }
+
+    if (typeof body.message === 'string') {
+      return body.message;
+    }
+
+    if (body.detail !== undefined) {
+      return JSON.stringify(body.detail);
+    }
+  } catch {
+    // The response may not contain JSON.
+  }
+
+  return fallback;
 }
 
 export default function Assessment() {
@@ -94,6 +121,7 @@ export default function Assessment() {
   const [uploadedDocuments, setUploadedDocuments] =
     useState<UploadedDocument[]>([]);
   const [uploadingDocument, setUploadingDocument] = useState(false);
+  const [uploadError, setUploadError] = useState('');
 
   const [caseStrengthReport, setCaseStrengthReport] = useState('');
   const [caseStrengthLoading, setCaseStrengthLoading] = useState(false);
@@ -116,18 +144,20 @@ export default function Assessment() {
 
   const { loadAssessment } = useAssessmentStore();
 
-  // Restore the selected chat, or start a new session when no token is requested.
   useEffect(() => {
     let cancelled = false;
 
     async function initializeSession() {
       if (requestedSession) {
-        if (initializedSessionRef.current === requestedSession) return;
+        if (initializedSessionRef.current === requestedSession) {
+          return;
+        }
 
         initializedSessionRef.current = requestedSession;
         setCaseStrengthReport('');
         setCaseStrengthError('');
         setUploadedDocuments([]);
+        setUploadError('');
 
         try {
           await loadConversation(requestedSession);
@@ -142,7 +172,8 @@ export default function Assessment() {
           ) {
             initializedSessionRef.current = null;
             setCaseStrengthError(
-              state.error || 'Could not reopen the selected conversation.'
+              state.error ||
+                'Could not reopen the selected conversation.',
             );
           }
         } catch (err) {
@@ -158,12 +189,21 @@ export default function Assessment() {
       const currentToken = useSessionStore.getState().sessionToken;
 
       if (currentToken) {
-        if (initializedSessionRef.current === currentToken) return;
+        if (initializedSessionRef.current === currentToken) {
+          return;
+        }
 
         initializedSessionRef.current = currentToken;
 
         if (useSessionStore.getState().messages.length === 0) {
-          await loadConversation(currentToken);
+          try {
+            await loadConversation(currentToken);
+          } catch (err) {
+            if (!cancelled) {
+              initializedSessionRef.current = null;
+              setCaseStrengthError(getApiErrorMessage(err));
+            }
+          }
         }
 
         return;
@@ -184,7 +224,7 @@ export default function Assessment() {
       } catch (err) {
         if (!cancelled) {
           initializedSessionRef.current = null;
-          console.error('Failed to start session:', err);
+          setCaseStrengthError(getApiErrorMessage(err));
         }
       }
     }
@@ -215,45 +255,98 @@ export default function Assessment() {
       setCaseStrengthReport('');
       setCaseStrengthError('');
     } catch (err) {
-      console.error('Failed to send message:', err);
+      setCaseStrengthError(getApiErrorMessage(err));
     }
   };
 
   const handleUploadDocument = async (file: File): Promise<void> => {
     setUploadingDocument(true);
+    setUploadError('');
 
     try {
+      if (!file || file.size === 0) {
+        throw new Error('Please select a non-empty file.');
+      }
+
+      const allowedExtensions = [
+        '.pdf',
+        '.txt',
+        '.jpg',
+        '.jpeg',
+        '.png',
+        '.webp',
+      ];
+
+      const extension = file.name
+        .slice(file.name.lastIndexOf('.'))
+        .toLowerCase();
+
+      if (!allowedExtensions.includes(extension)) {
+        throw new Error(
+          'Supported files: PDF, TXT, JPG, JPEG, PNG, and WEBP.',
+        );
+      }
+
+      const maxFileSize = 10 * 1024 * 1024;
+
+      if (file.size > maxFileSize) {
+        throw new Error('The maximum upload size is 10 MB.');
+      }
+
       const formData = new FormData();
       formData.append('file', file);
 
-      const response = await fetch(
-        `${API_BASE_URL.replace(/\/$/, '')}/api/v1/documents/analyze`,
-        {
-          method: 'POST',
-          body: formData,
-        }
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(
+        () => controller.abort(),
+        240_000,
       );
 
-      if (!response.ok) {
-        let message = `Upload failed (${response.status}).`;
+      let response: Response;
 
-        try {
-          const body = await response.json();
-
-          if (typeof body.detail === 'string') {
-            message = body.detail;
-          } else if (typeof body.message === 'string') {
-            message = body.message;
-          }
-        } catch {
-          // Keep the fallback message.
+      try {
+        response = await fetch(
+          `${API_BASE_URL}/api/v1/documents/analyze`,
+          {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal,
+          },
+        );
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          throw new Error(
+            'Document review timed out after 4 minutes. Try a smaller file or check the backend.',
+          );
         }
 
-        throw new Error(message);
+        if (err instanceof TypeError) {
+          throw new Error(
+            `Cannot connect to ${API_BASE_URL}. Check that the backend is running and CORS permits the frontend origin.`,
+          );
+        }
+
+        throw err;
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+
+      if (!response.ok) {
+        throw new Error(await readResponseError(response));
       }
 
       const result =
         (await response.json()) as DocumentReviewResult;
+
+      if (
+        !result ||
+        typeof result.message !== 'string' ||
+        typeof result.review_status !== 'string'
+      ) {
+        throw new Error(
+          'The server returned an unexpected document-review response.',
+        );
+      }
 
       setUploadedDocuments((previous) => [
         ...previous,
@@ -263,15 +356,13 @@ export default function Assessment() {
         },
       ]);
     } catch (err) {
-      if (err instanceof TypeError) {
-        throw new Error(
-          'Cannot connect to the document service. Check that the backend is running.'
-        );
-      }
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Unable to upload this document.';
 
-      throw err instanceof Error
-        ? err
-        : new Error('Unable to upload this document.');
+      setUploadError(message);
+      throw new Error(message);
     } finally {
       setUploadingDocument(false);
     }
@@ -284,7 +375,7 @@ export default function Assessment() {
       await loadAssessment(sessionToken);
       navigate(`/results/${encodeURIComponent(sessionToken)}`);
     } catch (err) {
-      console.error('Could not load assessment results:', err);
+      setCaseStrengthError(getApiErrorMessage(err));
     }
   };
 
@@ -292,7 +383,7 @@ export default function Assessment() {
     if (
       !sessionToken ||
       !window.confirm(
-        'End this session? The conversation will remain in your chat history unless you delete it.'
+        'End this session? The conversation will remain in your chat history unless you delete it.',
       )
     ) {
       return;
@@ -304,21 +395,21 @@ export default function Assessment() {
       initializedSessionRef.current = null;
       navigate('/');
     } catch (err) {
-      console.error('Failed to end session:', err);
+      setCaseStrengthError(getApiErrorMessage(err));
     }
   };
 
   const handleReviewCaseStrength = async () => {
     if (!sessionToken) {
       setCaseStrengthError(
-        'There is no active session. Please start a new assessment.'
+        'There is no active session. Please start a new assessment.',
       );
       return;
     }
 
     if (!messages.some((message) => message.role === 'USER')) {
       setCaseStrengthError(
-        'Please describe your legal issue before requesting a review.'
+        'Please describe your legal issue before requesting a review.',
       );
       return;
     }
@@ -328,14 +419,13 @@ export default function Assessment() {
     setCaseStrengthReport('');
 
     try {
-      const result =
-        (await apiClient.getCaseStrength(
-          sessionToken
-        )) as CaseStrengthResponse;
+      const result = (await apiClient.getCaseStrength(
+        sessionToken,
+      )) as CaseStrengthResponse;
 
       if (!result || typeof result.analysis !== 'string') {
         throw new Error(
-          'The server returned an unexpected case-review response.'
+          'The server returned an unexpected case-review response.',
         );
       }
 
@@ -348,10 +438,9 @@ export default function Assessment() {
           result.disclaimer || '',
         ]
           .filter(Boolean)
-          .join('\n\n')
+          .join('\n\n'),
       );
-    } catch (err: unknown) {
-      console.error('Case-strength request failed:', err);
+    } catch (err) {
       setCaseStrengthError(getApiErrorMessage(err));
     } finally {
       setCaseStrengthLoading(false);
@@ -398,17 +487,14 @@ export default function Assessment() {
             <div className="mx-auto max-w-4xl px-4">
               <div className="flex items-start gap-3">
                 <AlertTriangle className="h-6 w-6 shrink-0 text-red-600" />
-
                 <div>
                   <h3 className="mb-1 font-semibold text-red-900">
                     Immediate Safety Concern Detected
                   </h3>
-
                   <p className="mb-3 text-sm text-red-800">
                     If you are in immediate danger, contact emergency
                     services right away.
                   </p>
-
                   <div className="flex flex-wrap gap-3 text-sm">
                     <a href="tel:112" className="btn btn-danger btn-sm">
                       Emergency: 112
@@ -456,18 +542,16 @@ export default function Assessment() {
               }}
             >
               <Scale className="mt-0.5 h-6 w-6 shrink-0 text-amber-900" />
-
               <div className="text-sm text-gray-900">
                 <strong className="mb-1 block font-bold text-amber-900">
                   Legal Assistance Notice
                 </strong>
-
                 <span className="text-gray-800">
                   Share only information relevant to your legal issue.
                   This tool provides preliminary information, not legal
-                  representation or a substitute for advice from a qualified
-                  lawyer. Extracting text from a document does not establish
-                  whether evidence is genuine or sufficient.
+                  representation or a substitute for advice from a
+                  qualified lawyer. Extracting text from a document does
+                  not establish whether evidence is genuine or sufficient.
                 </span>
               </div>
             </div>
@@ -476,7 +560,6 @@ export default function Assessment() {
               <div className="mb-6 rounded-lg border border-red-200 bg-red-50 p-6">
                 <div className="mb-4 flex items-start gap-3">
                   <AlertTriangle className="h-6 w-6 shrink-0 text-red-600" />
-
                   <div className="flex-1">
                     <h3 className="mb-1 font-semibold text-red-900">
                       Connection Error
@@ -484,7 +567,6 @@ export default function Assessment() {
                     <p className="text-sm text-red-800">{error}</p>
                   </div>
                 </div>
-
                 <div className="flex gap-3">
                   <Button
                     onClick={() => {
@@ -496,7 +578,6 @@ export default function Assessment() {
                   >
                     Start New Assessment
                   </Button>
-
                   <Button onClick={clearError} variant="secondary">
                     Dismiss
                   </Button>
@@ -517,7 +598,6 @@ export default function Assessment() {
                   <div className="rounded-lg bg-amber-100 p-2">
                     <FileText className="h-6 w-6 text-amber-800" />
                   </div>
-
                   <div className="min-w-0 flex-1">
                     <h3 className="break-words font-semibold text-gray-900">
                       {result.filename}
@@ -526,7 +606,6 @@ export default function Assessment() {
                       {(result.size_bytes / 1024).toFixed(1)} KB
                     </p>
                   </div>
-
                   {result.review_status === 'ai_review_completed' ? (
                     <CheckCircle className="h-5 w-5 shrink-0 text-green-600" />
                   ) : (
@@ -543,7 +622,6 @@ export default function Assessment() {
                     <summary className="cursor-pointer font-medium text-slate-800">
                       View extracted text
                     </summary>
-
                     <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words font-sans text-sm text-slate-700">
                       {result.extracted_text}
                     </pre>
@@ -555,7 +633,6 @@ export default function Assessment() {
                     <h4 className="mb-2 text-sm font-semibold text-gray-900">
                       Suggested next steps
                     </h4>
-
                     <ul className="list-disc space-y-1 pl-5 text-sm text-gray-700">
                       {result.next_steps.map((step, index) => (
                         <li key={`${id}-step-${index}`}>{step}</li>
@@ -565,16 +642,34 @@ export default function Assessment() {
                 )}
 
                 <p className="mt-4 border-t border-slate-200 pt-3 text-xs text-slate-500">
-                  Preliminary review only. This does not verify the document
-                  or predict the outcome of a legal case.
+                  Preliminary review only. This does not verify the
+                  document or predict the outcome of a legal case.
                 </p>
               </div>
             ))}
 
+            {uploadError && (
+              <div
+                role="alert"
+                className="mb-5 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <p className="whitespace-pre-wrap">{uploadError}</p>
+                  <button
+                    type="button"
+                    className="shrink-0 font-semibold underline"
+                    onClick={() => setUploadError('')}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+
             {uploadingDocument && (
               <div className="mb-5 flex items-center gap-3 rounded-lg bg-white p-4 text-sm text-gray-700 shadow">
                 <LoadingSpinner size="sm" />
-                Reviewing your document...
+                Uploading and reviewing your document. This may take a few minutes…
               </div>
             )}
 
@@ -585,17 +680,14 @@ export default function Assessment() {
                 <h3 className="mb-2 font-semibold text-slate-900">
                   Ready to see your assessment results?
                 </h3>
-
                 <p className="mb-4 text-sm text-slate-600">
                   Continue describing your issue or view the preliminary
                   assessment based on your conversation.
                 </p>
-
                 <div className="flex flex-col justify-center gap-3 sm:flex-row">
                   <Button onClick={handleViewResults} variant="primary">
                     View Results
                   </Button>
-
                   <Button variant="secondary" disabled>
                     Continue Conversation
                   </Button>
@@ -618,57 +710,54 @@ export default function Assessment() {
           }
         />
 
-        {/* Bottom controls — scrollable so case-strength results don't overflow */}
         <div className="overflow-y-auto">
+          {sessionToken &&
+            messages.some((message) => message.role === 'USER') && (
+              <div className="mt-5 rounded-xl border border-indigo-100 bg-indigo-50 p-4">
+                <h3 className="font-semibold text-indigo-950">
+                  Preliminary case strength
+                </h3>
+                <p className="mt-1 text-sm text-indigo-900">
+                  Review the facts and evidence you have shared. This is
+                  not a prediction of winning.
+                </p>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={caseStrengthLoading || isSending}
+                  onClick={handleReviewCaseStrength}
+                >
+                  {caseStrengthLoading
+                    ? 'Reviewing evidence…'
+                    : 'Review my case strength'}
+                </Button>
 
-        {sessionToken && messages.some((message) => message.role === 'USER') && (
-          <div className="mt-5 rounded-xl border border-indigo-100 bg-indigo-50 p-4">
-            <h3 className="font-semibold text-indigo-950">
-              Preliminary case strength
-            </h3>
+                {caseStrengthError && (
+                  <p className="mt-2 whitespace-pre-wrap text-sm text-red-700">
+                    {caseStrengthError}
+                  </p>
+                )}
 
-            <p className="mt-1 text-sm text-indigo-900">
-              Review the facts and evidence you have shared. This is not
-              a prediction of winning.
-            </p>
-
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={caseStrengthLoading || isSending}
-              onClick={handleReviewCaseStrength}
-            >
-              {caseStrengthLoading
-                ? 'Reviewing evidence…'
-                : 'Review my case strength'}
-            </Button>
-
-            {caseStrengthError && (
-              <p className="mt-2 whitespace-pre-wrap text-sm text-red-700">
-                {caseStrengthError}
-              </p>
-            )}
-
-            {caseStrengthReport && (
-              <div className="mt-4 whitespace-pre-wrap rounded-lg bg-white p-4 text-sm leading-6 text-slate-800">
-                {caseStrengthReport}
+                {caseStrengthReport && (
+                  <div className="mt-4 whitespace-pre-wrap rounded-lg bg-white p-4 text-sm leading-6 text-slate-800">
+                    {caseStrengthReport}
+                  </div>
+                )}
               </div>
             )}
-          </div>
-        )}
 
-        {sessionToken && messages.length > 0 && (
-          <div className="mt-4 text-center">
-            <Button
-              onClick={handleEndSession}
-              variant="secondary"
-              size="sm"
-            >
-              End Session
-            </Button>
-          </div>
-        )}
-        </div>{/* end scrollable bottom controls */}
+          {sessionToken && messages.length > 0 && (
+            <div className="mt-4 text-center">
+              <Button
+                onClick={handleEndSession}
+                variant="secondary"
+                size="sm"
+              >
+                End Session
+              </Button>
+            </div>
+          )}
+        </div>
       </div>
     </Layout>
   );

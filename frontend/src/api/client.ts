@@ -93,7 +93,7 @@ class ApiClient {
       headers: {
         'Content-Type': 'application/json',
       },
-      timeout: 30000,
+      timeout: 120000,
     });
 
     this.client.interceptors.request.use(
